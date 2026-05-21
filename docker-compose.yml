@@ -1,0 +1,49 @@
+services:
+  api1:
+    build: ./api
+    environment:
+      CTRL_SOCK: /sockets/api1.ctrl
+    volumes:
+      - sockets:/sockets
+    deploy:
+      resources:
+        limits:
+          cpus: "0.425"
+          memory: "160MB"
+
+  api2:
+    build: ./api
+    environment:
+      CTRL_SOCK: /sockets/api2.ctrl
+    volumes:
+      - sockets:/sockets
+    deploy:
+      resources:
+        limits:
+          cpus: "0.425"
+          memory: "160MB"
+
+  lb:
+    image: jrblatt/so-no-forevis:v1.0.0
+    environment:
+      PORT: "9999"
+      UPSTREAMS: /sockets/api1,/sockets/api2
+      WORKERS: "1"
+    ports:
+      - "9999:9999"
+    volumes:
+      - sockets:/sockets
+    depends_on:
+      - api1
+      - api2
+    restart: on-failure
+    security_opt:
+      - seccomp=unconfined
+    deploy:
+      resources:
+        limits:
+          cpus: "0.15"
+          memory: "30MB"
+
+volumes:
+  sockets:
