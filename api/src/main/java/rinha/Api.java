@@ -6,6 +6,7 @@ import java.lang.foreign.Linker;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.invoke.MethodHandle;
+import java.nio.file.Path;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
 import static java.lang.foreign.ValueLayout.JAVA_BYTE;
@@ -47,18 +48,27 @@ public class Api {
     private static final int SOL_SOCKET  = 1;
     private static final int SCM_RIGHTS  = 1;
 
-    private static final byte[] RESPONSE = (
+    private static final byte[] DEFAULT_RESPONSE = (
         "HTTP/1.1 201 Created\r\n" +
         "Content-Length: 0\r\n" +
         "Connection: close\r\n" +
         "\r\n"
     ).getBytes();
 
+    // Byte prefix used to route GET /ready without allocating strings on the hot path.
+    private static final byte[] GET_READY_PREFIX = "GET /ready".getBytes();
+
     public static void main(String[] args) throws Throwable {
-        String path = System.getenv().getOrDefault("CTRL_SOCK", "/sockets/api.ctrl");
+        String ctrlPath  = System.getenv().getOrDefault("CTRL_SOCK",   "/run/api.ctrl");
+        String indexFile = System.getenv().getOrDefault("INDEX_FILE",  "/data/index.bin");
+
+        KdTreeLoader loader = new KdTreeLoader(Path.of(indexFile));
+        loader.startLoading();
+
+        ReadyHandler readyHandler = new ReadyHandler(loader);
 
         try (Arena arena = Arena.ofConfined()) {
-            MemorySegment pathC = arena.allocateFrom(path);
+            MemorySegment pathC = arena.allocateFrom(ctrlPath);
             unlink.invoke(pathC);
 
             int srv = (int) socket.invoke(AF_UNIX, SOCK_STREAM, 0);
@@ -66,18 +76,19 @@ public class Api {
 
             MemorySegment addr = arena.allocate(110);
             addr.set(JAVA_SHORT, 0, (short) AF_UNIX);
-            byte[] pb = path.getBytes();
+            byte[] pb = ctrlPath.getBytes();
             MemorySegment.copy(pb, 0, addr, JAVA_BYTE, 2, pb.length);
             int addrLen = 2 + pb.length + 1;
 
             if ((int) bind.invoke(srv, addr, addrLen) < 0) throw new RuntimeException("bind() failed");
             if ((int) listen.invoke(srv, 16) < 0)          throw new RuntimeException("listen() failed");
 
-            System.out.println("[api] listening on " + path);
+            System.out.println("[api] listening on " + ctrlPath);
 
-            MemorySegment respSeg = arena.allocate(RESPONSE.length);
-            MemorySegment.copy(RESPONSE, 0, respSeg, JAVA_BYTE, 0, RESPONSE.length);
-            MemorySegment reqBuf = arena.allocate(4096);
+            MemorySegment defaultSeg  = allocSeg(arena, DEFAULT_RESPONSE);
+            MemorySegment readyOkSeg  = allocSeg(arena, ReadyHandler.LOADED_RESPONSE);
+            MemorySegment readyErrSeg = allocSeg(arena, ReadyHandler.NOT_LOADED_RESPONSE);
+            MemorySegment reqBuf      = arena.allocate(4096);
 
             MemorySegment iovBuf = arena.allocate(1);
             MemorySegment iov    = arena.allocate(16);
@@ -90,20 +101,29 @@ public class Api {
             while (true) {
                 int ctrl = (int) accept.invoke(srv, MemorySegment.NULL, MemorySegment.NULL);
                 if (ctrl < 0) { System.err.println("[api] accept failed"); continue; }
-                System.out.println("[api] lb connected");
-                serve(ctrl, msg, iov, cmsg, reqBuf, respSeg);
+                serve(ctrl, msg, iov, cmsg, reqBuf, defaultSeg, readyOkSeg, readyErrSeg, loader);
                 close.invoke(ctrl);
-                System.out.println("[api] lb disconnected");
             }
         }
     }
 
+    private static MemorySegment allocSeg(Arena arena, byte[] bytes) {
+        MemorySegment seg = arena.allocate(bytes.length);
+        MemorySegment.copy(bytes, 0, seg, JAVA_BYTE, 0, bytes.length);
+        return seg;
+    }
+
+    private static boolean isGetReady(MemorySegment buf) {
+        for (int i = 0; i < GET_READY_PREFIX.length; i++) {
+            if (buf.get(JAVA_BYTE, i) != GET_READY_PREFIX[i]) return false;
+        }
+        return true;
+    }
+
     private static void serve(int ctrl, MemorySegment msg, MemorySegment iov,
                               MemorySegment cmsg, MemorySegment reqBuf,
-                              MemorySegment respSeg) throws Throwable {
-        long respLen = respSeg.byteSize();
-        long reqCap  = reqBuf.byteSize();
-
+                              MemorySegment defaultSeg, MemorySegment readyOkSeg,
+                              MemorySegment readyErrSeg, KdTreeLoader loader) throws Throwable {
         while (true) {
             msg.fill((byte) 0);
             msg.set(ADDRESS,   16, iov);
@@ -123,8 +143,14 @@ public class Api {
             }
             int fd = cmsg.get(JAVA_INT, 16);
 
-            read.invoke(fd, reqBuf, reqCap);
-            write.invoke(fd, respSeg, respLen);
+            long bytesRead = (long) read.invoke(fd, reqBuf, reqBuf.byteSize());
+            if (bytesRead <= 0) { close.invoke(fd); continue; }
+
+            MemorySegment resp = isGetReady(reqBuf)
+                ? (loader.isLoaded() ? readyOkSeg : readyErrSeg)
+                : defaultSeg;
+
+            write.invoke(fd, resp, resp.byteSize());
             close.invoke(fd);
         }
     }

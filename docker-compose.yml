@@ -1,8 +1,11 @@
 services:
   api1:
-    build: ./api
+    build:
+      context: .
+      dockerfile: api/Dockerfile
     environment:
       CTRL_SOCK: /sockets/api1.ctrl
+      INDEX_FILE: /data/index.bin
     volumes:
       - sockets:/sockets
     deploy:
@@ -12,9 +15,12 @@ services:
           memory: "160MB"
 
   api2:
-    build: ./api
+    build:
+      context: .
+      dockerfile: api/Dockerfile
     environment:
       CTRL_SOCK: /sockets/api2.ctrl
+      INDEX_FILE: /data/index.bin
     volumes:
       - sockets:/sockets
     deploy:
