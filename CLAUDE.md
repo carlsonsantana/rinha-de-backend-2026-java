@@ -78,12 +78,13 @@ Whatever path: once we have the int FD, immediately set `O_NONBLOCK`, register w
 - **Module flags** (HotSpot): `--enable-native-access=ALL-UNNAMED`, `--add-modules=jdk.incubator.vector`, plus `--add-opens=java.base/sun.nio.ch=ALL-UNNAMED` only if we end up wrapping the received FD as a `SocketChannel`.
 - **Vector search**:
   - Index built **once at startup** from `references.json.gz`. Don't ship a pre-built index — challenge forbids using test payloads as reference, but bundled reference data is fine.
-  - 3M × 14 × 4 bytes = **168 MB** as flat float32. That alone is half our per-container RAM. Options:
-    - Quantize to `int8` → 42 MB. Re-derive `max` per dim from the dataset; precision loss is acceptable for top-5 over Euclidean.
+  - 3M × 14 × 4 bytes = 168 MB as flat float32 — half our per-container RAM. Reference vector components in `references.json.gz` have **at most 4 decimal places**, so store them as fixed-point `short` (int16) scaled by **10,000**: `s = round(f * 10000)`. All clamped dims are in `[0, 1]` → `[0, 10000]`; the `-1` null sentinel for dims 5/6 becomes `-10000`. Range fits comfortably in `short` (`[-32768, 32767]`). Storage: **3M × 14 × 2 bytes = 84 MB** as flat `short[]`, exact (no quantization loss), and SIMD-friendly via `ShortVector`.
     - Memory-map a packed off-heap buffer (`MappedByteBuffer` or `Arena.allocateShared`) — keeps it out of GC.
     - Share the index across api1/api2 via a read-only mmap of a file in the shared volume; build it in an init container.
-  - Top-5 with brute force is fine and matches the reference behavior. SIMD via the Vector API (`jdk.incubator.vector`) gives a real speedup for 14-dim L2 — use `FloatVector.SPECIES_PREFERRED`.
-  - If brute force on 3M is too slow under the CPU budget: HNSW (jvector) is the fallback. Verify scoring parity first — neighbors must match the brute-force top-5 closely or detection score tanks.
+    - At query time, scale the incoming 14-dim vector the same way (`(short) round(v * 10000)`) and do L2 distance in `int` (square of differences fits: max `20000² × 14 ≈ 5.6e9`, use `long` accumulator to be safe). No float math on the hot path.
+  - Top-5 via **KD-Tree** over the 14-dim points. Exact nearest neighbors (matches reference behavior), `O(log n)` average per query versus `O(n)` brute force — the win on 3M points is large. Build once at boot from the flat point array; store the tree as parallel arrays (axis, split value as `short`, left/right indices) packed off-heap to avoid per-node object overhead.
+  - Implementation notes: median-of-medians or quickselect at build time; bounded-priority-queue (max-heap of size 5) during search; prune subtrees when axis-distance exceeds current top-5 worst. SIMD via the Vector API (`jdk.incubator.vector`, `ShortVector.SPECIES_PREFERRED`) on the per-leaf L2 distance — widen to `int` lanes for the squared-difference accumulator.
+  - 14 dims is near the edge where KD-Tree pruning degrades toward linear scan — measure. Fallbacks if pruning is ineffective: brute force with SIMD, or HNSW (jvector). Verify scoring parity against brute force before switching — neighbors must match closely or detection score tanks.
 
 ## Scoring shape (what to optimize for)
 
@@ -167,11 +168,11 @@ Network must be `bridge` (no `host`, no `privileged`). Images must be public lin
 ## First-pass milestones
 
 1. Bare HTTP server on a normal TCP socket (no LB), `/ready` + `/fraud-score` returning a constant. Verify k6 can hit it.
-2. Load `references.json.gz`, build flat float32 index, brute-force top-5, real fraud_score. Verify detection score on a sample.
+2. Load `references.json.gz`, convert each component to `short` via `round(f * 10000)`, build flat `short[]` index, brute-force top-5 with integer L2, real fraud_score. Verify detection score on a sample.
 3. Native-image build; check startup time and RSS fit under caps.
 4. JNI `recvmsg` shim; switch API from `ServerSocket` to FD-receive loop on `/run/apiN.ctrl`.
 5. Wire SoNoForevis in front, two replicas, run k6 end-to-end.
-6. Quantize index to int8, add Vector API SIMD, profile hot path, tune GC / heap / `-Xmx`.
+6. Add Vector API SIMD (`ShortVector` → `IntVector` widening for squared diffs), profile hot path, tune GC / heap / `-Xmx`.
 
 ## Useful upstream pointers
 
