@@ -49,23 +49,28 @@ public class Api {
     private static final int SCM_RIGHTS  = 1;
 
     private static final byte[] DEFAULT_RESPONSE = (
-        "HTTP/1.1 201 Created\r\n" +
+        "HTTP/1.1 501 Not Implemented\r\n" +
         "Content-Length: 0\r\n" +
         "Connection: close\r\n" +
         "\r\n"
     ).getBytes();
 
-    // Byte prefix used to route GET /ready without allocating strings on the hot path.
-    private static final byte[] GET_READY_PREFIX = "GET /ready".getBytes();
+    private static final byte[] GET_READY_PREFIX    = "GET /ready".getBytes();
+    private static final byte[] POST_FRAUD_PREFIX   = "POST /fraud-score".getBytes();
 
     public static void main(String[] args) throws Throwable {
         String ctrlPath  = System.getenv().getOrDefault("CTRL_SOCK",   "/run/api.ctrl");
         String indexFile = System.getenv().getOrDefault("INDEX_FILE",  "/data/index.bin");
+        String normFile  = System.getenv().getOrDefault("NORM_FILE",   "/data/normalization.json");
+        String mccFile   = System.getenv().getOrDefault("MCC_FILE",    "/data/mcc_risk.json");
+
+        Normalizer norm = Normalizer.load(Path.of(normFile), Path.of(mccFile));
+        System.out.println("[api] normalizer loaded");
 
         KdTreeLoader loader = new KdTreeLoader(Path.of(indexFile));
         loader.startLoading();
 
-        ReadyHandler readyHandler = new ReadyHandler(loader);
+        FraudScoreHandler fraudHandler = new FraudScoreHandler(loader, norm);
 
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment pathC = arena.allocateFrom(ctrlPath);
@@ -88,6 +93,8 @@ public class Api {
             MemorySegment defaultSeg  = allocSeg(arena, DEFAULT_RESPONSE);
             MemorySegment readyOkSeg  = allocSeg(arena, ReadyHandler.LOADED_RESPONSE);
             MemorySegment readyErrSeg = allocSeg(arena, ReadyHandler.NOT_LOADED_RESPONSE);
+            // Max fraud response is ~200 bytes; 512 is a safe upper bound.
+            MemorySegment fraudBuf    = arena.allocate(512);
             MemorySegment reqBuf      = arena.allocate(4096);
 
             MemorySegment iovBuf = arena.allocate(1);
@@ -101,7 +108,9 @@ public class Api {
             while (true) {
                 int ctrl = (int) accept.invoke(srv, MemorySegment.NULL, MemorySegment.NULL);
                 if (ctrl < 0) { System.err.println("[api] accept failed"); continue; }
-                serve(ctrl, msg, iov, cmsg, reqBuf, defaultSeg, readyOkSeg, readyErrSeg, loader);
+                serve(ctrl, msg, iov, cmsg, reqBuf,
+                      defaultSeg, readyOkSeg, readyErrSeg, fraudBuf,
+                      loader, fraudHandler);
                 close.invoke(ctrl);
             }
         }
@@ -113,17 +122,17 @@ public class Api {
         return seg;
     }
 
-    private static boolean isGetReady(MemorySegment buf) {
-        for (int i = 0; i < GET_READY_PREFIX.length; i++) {
-            if (buf.get(JAVA_BYTE, i) != GET_READY_PREFIX[i]) return false;
-        }
+    private static boolean startsWith(MemorySegment buf, byte[] prefix) {
+        for (int i = 0; i < prefix.length; i++)
+            if (buf.get(JAVA_BYTE, i) != prefix[i]) return false;
         return true;
     }
 
     private static void serve(int ctrl, MemorySegment msg, MemorySegment iov,
                               MemorySegment cmsg, MemorySegment reqBuf,
                               MemorySegment defaultSeg, MemorySegment readyOkSeg,
-                              MemorySegment readyErrSeg, KdTreeLoader loader) throws Throwable {
+                              MemorySegment readyErrSeg, MemorySegment fraudBuf,
+                              KdTreeLoader loader, FraudScoreHandler fraudHandler) throws Throwable {
         while (true) {
             msg.fill((byte) 0);
             msg.set(ADDRESS,   16, iov);
@@ -146,11 +155,23 @@ public class Api {
             long bytesRead = (long) read.invoke(fd, reqBuf, reqBuf.byteSize());
             if (bytesRead <= 0) { close.invoke(fd); continue; }
 
-            MemorySegment resp = isGetReady(reqBuf)
-                ? (loader.isLoaded() ? readyOkSeg : readyErrSeg)
-                : defaultSeg;
+            MemorySegment resp;
+            long respLen;
 
-            write.invoke(fd, resp, resp.byteSize());
+            if (startsWith(reqBuf, GET_READY_PREFIX)) {
+                resp    = loader.isLoaded() ? readyOkSeg : readyErrSeg;
+                respLen = resp.byteSize();
+            } else if (startsWith(reqBuf, POST_FRAUD_PREFIX)) {
+                byte[] r = fraudHandler.handle(reqBuf, (int) bytesRead);
+                MemorySegment.copy(r, 0, fraudBuf, JAVA_BYTE, 0, r.length);
+                resp    = fraudBuf;
+                respLen = r.length;
+            } else {
+                resp    = defaultSeg;
+                respLen = resp.byteSize();
+            }
+
+            write.invoke(fd, resp, respLen);
             close.invoke(fd);
         }
     }
