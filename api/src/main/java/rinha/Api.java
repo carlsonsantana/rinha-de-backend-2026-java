@@ -105,6 +105,15 @@ public class Api {
             MemorySegment cmsg = arena.allocate(24);
             MemorySegment msg  = arena.allocate(56);
 
+            // Drive JIT to compile FFM call sites before the first real request.
+            // recvmsg(-1,...) returns EBADF immediately — no blocking, just warms the stub.
+            for (int w = 0; w < 5; w++) {
+                recvmsg.invoke(-1, msg, 0);
+                read.invoke(-1, reqBuf, 1L);
+                write.invoke(-1, reqBuf, 0L);
+            }
+            System.out.println("[api] FFM stubs warmed");
+
             while (true) {
                 int ctrl = (int) accept.invoke(srv, MemorySegment.NULL, MemorySegment.NULL);
                 if (ctrl < 0) { System.err.println("[api] accept failed"); continue; }
