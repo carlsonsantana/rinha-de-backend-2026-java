@@ -55,8 +55,8 @@ public class Api {
         "\r\n"
     ).getBytes();
 
-    private static final byte[] GET_READY_PREFIX    = "GET /ready".getBytes();
-    private static final byte[] POST_FRAUD_PREFIX   = "POST /fraud-score".getBytes();
+    private static final byte GET_READY_PREFIX    = "GET /ready".getBytes()[0];
+    private static final byte POST_FRAUD_PREFIX   = "POST /fraud-score".getBytes()[0];
 
     public static void main(String[] args) throws Throwable {
         String ctrlPath  = System.getenv().getOrDefault("CTRL_SOCK",   "/run/api.ctrl");
@@ -122,10 +122,8 @@ public class Api {
         return seg;
     }
 
-    private static boolean startsWith(MemorySegment buf, byte[] prefix) {
-        for (int i = 0; i < prefix.length; i++)
-            if (buf.get(JAVA_BYTE, i) != prefix[i]) return false;
-        return true;
+    private static boolean isPostFraud(MemorySegment buf) {
+        return buf.get(JAVA_BYTE, 0) == POST_FRAUD_PREFIX;
     }
 
     private static void serve(int ctrl, MemorySegment msg, MemorySegment iov,
@@ -158,16 +156,13 @@ public class Api {
             MemorySegment resp;
             long respLen;
 
-            if (startsWith(reqBuf, GET_READY_PREFIX)) {
-                resp    = loader.isLoaded() ? readyOkSeg : readyErrSeg;
-                respLen = resp.byteSize();
-            } else if (startsWith(reqBuf, POST_FRAUD_PREFIX)) {
+            if (isPostFraud(reqBuf)) {
                 byte[] r = fraudHandler.handle(reqBuf, (int) bytesRead);
                 MemorySegment.copy(r, 0, fraudBuf, JAVA_BYTE, 0, r.length);
                 resp    = fraudBuf;
                 respLen = r.length;
             } else {
-                resp    = defaultSeg;
+                resp    = loader.isLoaded() ? readyOkSeg : readyErrSeg;
                 respLen = resp.byteSize();
             }
 

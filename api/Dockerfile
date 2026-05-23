@@ -3,7 +3,7 @@ WORKDIR /build
 COPY api/pom.xml .
 RUN mvn -B -q dependency:go-offline
 COPY api/src ./src
-RUN mvn -B -q -DskipTests package
+RUN mvn -B -q -DskipTests clean package
 
 FROM eclipse-temurin:25-jre AS indexer
 WORKDIR /app
