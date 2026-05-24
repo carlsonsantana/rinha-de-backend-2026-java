@@ -46,6 +46,12 @@ public final class FraudScoreHandler {
     private static final int[]  nodes = new int[5];
     private static int size  = 0;
 
+    // Explicit stack for iterative KD-tree search; each entry is a deferred
+    // far-branch check. Depth = tree depth ≈ log₂(3M) ≈ 22; 64 is generous.
+    private static final int    STACK_CAP  = 64;
+    private static final int[]  stackNode  = new int[STACK_CAP];
+    private static final long[] stackBound = new long[STACK_CAP];
+
     public FraudScoreHandler(KdTreeLoader loader, Normalizer norm) {
         this.loader = loader;
         this.norm   = norm;
@@ -149,26 +155,41 @@ public final class FraudScoreHandler {
         return frauds;
     }
 
-    private static void search(KdTreeLoader.KdTreeData tree, int nodeId, short[] query) {
-        if (nodeId < 0) return;
+    private static void search(KdTreeLoader.KdTreeData tree, int rootId, short[] query) {
+        int nodeId = rootId;
+        int sp = 0;
 
-        long distSq = 0;
-        for (int d = 0; d < DIMS; d++) {
-            long diff = (long) query[d] - tree.pointAt(nodeId, d);
-            distSq += diff * diff;
+        while (true) {
+            // Pop deferred far-branches until we land on a node worth visiting.
+            // The prune bound is re-checked here (not at push) because dists[0]
+            // may have improved while the near subtree was being explored.
+            while (nodeId < 0) {
+                if (sp == 0) return;
+                sp--;
+                nodeId = stackNode[sp];
+                if (size >= 5 && stackBound[sp] >= dists[0]) nodeId = -1;
+            }
+
+            long distSq = 0;
+            for (int d = 0; d < DIMS; d++) {
+                long diff = (long) query[d] - tree.pointAt(nodeId, d);
+                distSq += diff * diff;
+            }
+            heapPush(distSq, nodeId);
+
+            int  axis     = tree.axis()[nodeId] & 0xFF;
+            long axisDiff = (long) query[axis] - tree.pointAt(nodeId, axis);
+            int  near     = axisDiff <= 0 ? tree.left()[nodeId]  : tree.right()[nodeId];
+            int  far      = axisDiff <= 0 ? tree.right()[nodeId] : tree.left()[nodeId];
+
+            if (far >= 0) {
+                stackNode[sp]  = far;
+                stackBound[sp] = axisDiff * axisDiff;
+                sp++;
+            }
+
+            nodeId = near;
         }
-        heapPush(distSq, nodeId);
-
-        int  axis     = tree.axis()[nodeId] & 0xFF;
-        long axisDiff = (long) query[axis] - tree.pointAt(nodeId, axis);
-        int  near     = axisDiff <= 0 ? tree.left()[nodeId]  : tree.right()[nodeId];
-        int  far      = axisDiff <= 0 ? tree.right()[nodeId] : tree.left()[nodeId];
-
-        search(tree, near, query);
-
-        // Prune far subtree when its closest possible point can't beat top-5 worst.
-        if (size < 5 || axisDiff * axisDiff < dists[0])
-            search(tree, far, query);
     }
 
     // Max-heap of capacity 5: dists[0] is always the worst (largest) distance.
