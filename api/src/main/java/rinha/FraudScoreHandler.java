@@ -54,9 +54,8 @@ public final class FraudScoreHandler {
 
     private final KdTreeLoader loader;
     private final Normalizer   norm;
-    private static final long[] dists = new long[5];
+    private static final long[] dists = {Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE};
     private static final int[]  nodes = new int[5];
-    private static int size  = 0;
 
     // Explicit stack for iterative KD-tree search; each entry is a deferred
     // far-branch check. Depth = tree depth ≈ log₂(3M) ≈ 22; 64 is generous.
@@ -151,19 +150,13 @@ public final class FraudScoreHandler {
     private static int countFrauds(KdTreeLoader.KdTreeData tree, short[] query) {
         search(tree, tree.root(), query);
         int frauds = 0;
-        for (int i = 0; i < size; i++)
+        for (int i = 0; i < 5; i++)
             if (tree.labels()[nodes[i]] == 1) frauds++;
-        dists[0] = 0;
-        dists[1] = 0;
-        dists[2] = 0;
-        dists[3] = 0;
-        dists[4] = 0;
-        nodes[0] = 0;
-        nodes[1] = 0;
-        nodes[2] = 0;
-        nodes[3] = 0;
-        nodes[4] = 0;
-        size = 0;
+        dists[0] = Long.MAX_VALUE;
+        dists[1] = Long.MAX_VALUE;
+        dists[2] = Long.MAX_VALUE;
+        dists[3] = Long.MAX_VALUE;
+        dists[4] = Long.MAX_VALUE;
         return frauds;
     }
 
@@ -200,7 +193,7 @@ public final class FraudScoreHandler {
                 if (sp == 0) return;
                 sp--;
                 nodeId = stackNode[sp];
-                if (size >= 5 && stackBound[sp] >= dists[0]) nodeId = -1;
+                if (stackBound[sp] >= dists[0]) nodeId = -1;
             }
 
             long base   = (long) nodeId * DIMS_STORED * 2;
@@ -224,18 +217,7 @@ public final class FraudScoreHandler {
 
     // Max-heap of capacity 5: dists[0] is always the worst (largest) distance.
     private static void heapPush(long dist, int nodeId) {
-        int n = size;
-        if (n < 5) {
-            dists[n] = dist;
-            nodes[n] = nodeId;
-            size  = n + 1;
-            int i = n;
-            while (i > 0) {
-                int p = (i - 1) >>> 1;
-                if (dists[p] < dists[i]) { swap(p, i); i = p; }
-                else break;
-            }
-        } else if (dist < dists[0]) {
+        if (dist < dists[0]) {
             dists[0] = dist;
             nodes[0] = nodeId;
             int i = 0;
