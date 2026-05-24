@@ -42,6 +42,9 @@ public final class FraudScoreHandler {
 
     private final KdTreeLoader loader;
     private final Normalizer   norm;
+    private static final long[] dists = new long[5];
+    private static final int[]  nodes = new int[5];
+    private static int size  = 0;
 
     public FraudScoreHandler(KdTreeLoader loader, Normalizer norm) {
         this.loader = loader;
@@ -128,18 +131,25 @@ public final class FraudScoreHandler {
     // ── KD-tree nearest-5 search ────────────────────────────────────────────
 
     private static int countFrauds(KdTreeLoader.KdTreeData tree, short[] query) {
-        long[] dists = new long[5];
-        int[]  nodes = new int[5];
-        int[]  size  = {0};
-        search(tree, tree.root(), query, dists, nodes, size);
+        search(tree, tree.root(), query);
         int frauds = 0;
-        for (int i = 0; i < size[0]; i++)
+        for (int i = 0; i < size; i++)
             if (tree.labels()[nodes[i]] == 1) frauds++;
+        dists[0] = 0;
+        dists[1] = 0;
+        dists[2] = 0;
+        dists[3] = 0;
+        dists[4] = 0;
+        nodes[0] = 0;
+        nodes[1] = 0;
+        nodes[2] = 0;
+        nodes[3] = 0;
+        nodes[4] = 0;
+        size = 0;
         return frauds;
     }
 
-    private static void search(KdTreeLoader.KdTreeData tree, int nodeId, short[] query,
-                                long[] dists, int[] nodes, int[] size) {
+    private static void search(KdTreeLoader.KdTreeData tree, int nodeId, short[] query) {
         if (nodeId < 0) return;
 
         long distSq = 0;
@@ -147,31 +157,31 @@ public final class FraudScoreHandler {
             long diff = (long) query[d] - tree.pointAt(nodeId, d);
             distSq += diff * diff;
         }
-        heapPush(dists, nodes, size, distSq, nodeId);
+        heapPush(distSq, nodeId);
 
         int  axis     = tree.axis()[nodeId] & 0xFF;
         long axisDiff = (long) query[axis] - tree.pointAt(nodeId, axis);
         int  near     = axisDiff <= 0 ? tree.left()[nodeId]  : tree.right()[nodeId];
         int  far      = axisDiff <= 0 ? tree.right()[nodeId] : tree.left()[nodeId];
 
-        search(tree, near, query, dists, nodes, size);
+        search(tree, near, query);
 
         // Prune far subtree when its closest possible point can't beat top-5 worst.
-        if (size[0] < 5 || axisDiff * axisDiff < dists[0])
-            search(tree, far, query, dists, nodes, size);
+        if (size < 5 || axisDiff * axisDiff < dists[0])
+            search(tree, far, query);
     }
 
     // Max-heap of capacity 5: dists[0] is always the worst (largest) distance.
-    private static void heapPush(long[] dists, int[] nodes, int[] size, long dist, int nodeId) {
-        int n = size[0];
+    private static void heapPush(long dist, int nodeId) {
+        int n = size;
         if (n < 5) {
             dists[n] = dist;
             nodes[n] = nodeId;
-            size[0]  = n + 1;
+            size  = n + 1;
             int i = n;
             while (i > 0) {
                 int p = (i - 1) >>> 1;
-                if (dists[p] < dists[i]) { swap(dists, nodes, p, i); i = p; }
+                if (dists[p] < dists[i]) { swap(p, i); i = p; }
                 else break;
             }
         } else if (dist < dists[0]) {
@@ -183,13 +193,13 @@ public final class FraudScoreHandler {
                 if (l < 5 && dists[l] > dists[max]) max = l;
                 if (r < 5 && dists[r] > dists[max]) max = r;
                 if (max == i) break;
-                swap(dists, nodes, i, max);
+                swap(i, max);
                 i = max;
             }
         }
     }
 
-    private static void swap(long[] dists, int[] nodes, int a, int b) {
+    private static void swap(int a, int b) {
         long td = dists[a]; dists[a] = dists[b]; dists[b] = td;
         int  tn = nodes[a]; nodes[a] = nodes[b]; nodes[b] = tn;
     }
