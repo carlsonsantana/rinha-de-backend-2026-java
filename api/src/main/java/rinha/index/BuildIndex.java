@@ -12,10 +12,11 @@ import java.util.zip.GZIPInputStream;
 
 public final class BuildIndex {
 
-    private static final int DIMS = 14;
-    private static final int SCALE = 10_000;
-    private static final int MAGIC = ('R') | ('N' << 8) | ('H' << 16) | ('A' << 24);
-    private static final int VERSION = 1;
+    private static final int DIMS        = 14;
+    private static final int DIMS_STORED = 16; // 14 dims + 2 zero shorts for 16-lane SIMD alignment
+    private static final int SCALE       = 10_000;
+    private static final int MAGIC       = ('R') | ('N' << 8) | ('H' << 16) | ('A' << 24);
+    private static final int VERSION     = 2;
     private static final int HEADER_BYTES = 32;
 
     public static void main(String[] args) throws Exception {
@@ -233,7 +234,7 @@ public final class BuildIndex {
 
     static long write(Path out, Loaded data, Tree tree) throws IOException {
         int n = data.n;
-        long pointsBytes = (long) n * DIMS * 2;
+        long pointsBytes = (long) n * DIMS_STORED * 2;
         long labelsBytes = n;
         long axisBytes = n;
         long childBytes = (long) n * 4;
@@ -255,7 +256,7 @@ public final class BuildIndex {
             drain(ch, header);
 
             ByteBuffer pBuf = ByteBuffer.allocateDirect(1 << 18).order(ByteOrder.LITTLE_ENDIAN);
-            int pointsPerChunk = pBuf.capacity() / (DIMS * 2);
+            int pointsPerChunk = pBuf.capacity() / (DIMS_STORED * 2);
             for (int i = 0; i < n; ) {
                 int end = Math.min(n, i + pointsPerChunk);
                 pBuf.clear();
@@ -263,6 +264,8 @@ public final class BuildIndex {
                     int orig = tree.permutation[j];
                     int base = orig * DIMS;
                     for (int d = 0; d < DIMS; d++) pBuf.putShort(data.points[base + d]);
+                    pBuf.putShort((short) 0); // SIMD padding lane 14
+                    pBuf.putShort((short) 0); // SIMD padding lane 15
                 }
                 pBuf.flip();
                 drain(ch, pBuf);

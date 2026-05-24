@@ -2,17 +2,29 @@ package rinha;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
+import java.nio.ByteOrder;
 import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
 
+import jdk.incubator.vector.IntVector;
+import jdk.incubator.vector.LongVector;
+import jdk.incubator.vector.ShortVector;
+import jdk.incubator.vector.VectorOperators;
+import jdk.incubator.vector.VectorSpecies;
+
 import static java.lang.foreign.ValueLayout.JAVA_BYTE;
 
 public final class FraudScoreHandler {
 
-    private static final int DIMS  = 14;
-    private static final int SCALE = 10_000;
+    private static final int DIMS        = 14;
+    private static final int DIMS_STORED = 16; // 14 dims + 2 SIMD padding shorts per node
+    private static final int SCALE       = 10_000;
+
+    private static final VectorSpecies<Short>   S_S256 = ShortVector.SPECIES_256;
+    private static final VectorSpecies<Integer> S_I256 = IntVector.SPECIES_256;
+    private static final VectorSpecies<Long>    S_L256 = LongVector.SPECIES_256;
 
     // All 6 possible responses pre-built at class load: fraud count 0..5 → score 0.0..1.0.
     // Zero allocation on the hot path.
@@ -123,10 +135,10 @@ public final class FraudScoreHandler {
         double d13 = Normalizer.clamp(p.merchantAvgAmount / norm.maxMerchantAvgAmount);
 
         return new short[]{
-            enc(d0), enc(d1), enc(d2), enc(d3),
-            enc(d4), enc(d5), enc(d6), enc(d7),
+            enc(d0), enc(d1), enc(d2),  enc(d3),
+            enc(d4), enc(d5), enc(d6),  enc(d7),
             enc(d8), enc(d9), enc(d10), enc(d11),
-            enc(d12), enc(d13)
+            enc(d12), enc(d13), 0, 0   // last 2 are SIMD padding lanes
         };
     }
 
@@ -155,6 +167,27 @@ public final class FraudScoreHandler {
         return frauds;
     }
 
+    private static long distSqSimd(short[] query, MemorySegment points, long byteOffset) {
+        ShortVector q    = ShortVector.fromArray(S_S256, query, 0);
+        ShortVector p    = ShortVector.fromMemorySegment(S_S256, points, byteOffset,
+                                                         ByteOrder.LITTLE_ENDIAN);
+        ShortVector diff = q.sub(p); // diff ∈ [-20000, 20000], fits in short
+
+        // Widen short→int before squaring: diff² ≤ 4×10⁸, fits in int
+        IntVector dLo = (IntVector) diff.castShape(S_I256, 0); // lanes 0–7
+        IntVector dHi = (IntVector) diff.castShape(S_I256, 1); // lanes 8–15
+        IntVector sqLo = dLo.mul(dLo);
+        IntVector sqHi = dHi.mul(dHi);
+
+        // Combine pairs before widening to long: sqLo[i]+sqHi[i] ≤ 8×10⁸ < INT_MAX
+        IntVector sqTotal = sqLo.add(sqHi);
+
+        // Widen int→long: sum of 8 lanes ≤ 8×8×10⁸=6.4×10⁹ overflows int, needs long
+        LongVector lo = (LongVector) sqTotal.castShape(S_L256, 0);
+        LongVector hi = (LongVector) sqTotal.castShape(S_L256, 1);
+        return lo.add(hi).reduceLanes(VectorOperators.ADD);
+    }
+
     private static void search(KdTreeLoader.KdTreeData tree, int rootId, short[] query) {
         int nodeId = rootId;
         int sp = 0;
@@ -170,11 +203,8 @@ public final class FraudScoreHandler {
                 if (size >= 5 && stackBound[sp] >= dists[0]) nodeId = -1;
             }
 
-            long distSq = 0;
-            for (int d = 0; d < DIMS; d++) {
-                long diff = (long) query[d] - tree.pointAt(nodeId, d);
-                distSq += diff * diff;
-            }
+            long base   = (long) nodeId * DIMS_STORED * 2;
+            long distSq = distSqSimd(query, tree.points(), base);
             heapPush(distSq, nodeId);
 
             int  axis     = tree.axis()[nodeId] & 0xFF;

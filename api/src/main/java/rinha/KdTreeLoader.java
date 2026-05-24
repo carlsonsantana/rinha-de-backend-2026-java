@@ -14,7 +14,9 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class KdTreeLoader {
 
     private static final int MAGIC        = 'R' | 'N' << 8 | 'H' << 16 | 'A' << 24;
+    private static final int VERSION      = 2;
     private static final int DIMS         = 14;
+    private static final int DIMS_STORED  = 16;
     private static final int HEADER_BYTES = 32;
 
     /**
@@ -36,7 +38,7 @@ public final class KdTreeLoader {
             ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
         public short pointAt(int nodeId, int dim) {
-            return points.get(LE_SHORT, ((long) nodeId * DIMS + dim) * 2);
+            return points.get(LE_SHORT, ((long) nodeId * DIMS_STORED + dim) * 2);
         }
     }
 
@@ -82,17 +84,18 @@ public final class KdTreeLoader {
             ByteBuffer hdr = mapped.asSlice(0, HEADER_BYTES)
                                    .asByteBuffer()
                                    .order(ByteOrder.LITTLE_ENDIAN);
-            int magic = hdr.getInt();
-            /* version */ hdr.getInt();
-            int n    = hdr.getInt();
-            int dims = hdr.getInt();
-            int root = hdr.getInt();
+            int magic   = hdr.getInt();
+            int version = hdr.getInt();
+            int n       = hdr.getInt();
+            int dims    = hdr.getInt();
+            int root    = hdr.getInt();
 
-            if (magic != MAGIC) throw new IOException("bad magic: 0x" + Integer.toHexString(magic));
-            if (dims  != DIMS)  throw new IOException("unexpected dims: " + dims);
+            if (magic   != MAGIC)   throw new IOException("bad magic: 0x" + Integer.toHexString(magic));
+            if (version != VERSION) throw new IOException("unsupported index version: " + version);
+            if (dims    != DIMS)    throw new IOException("unexpected dims: " + dims);
 
-            long pointsOff  = HEADER_BYTES;
-            long pointsBytes = (long) n * DIMS * 2;
+            long pointsOff   = HEADER_BYTES;
+            long pointsBytes = (long) n * DIMS_STORED * 2;
             long labelsOff  = pointsOff + pointsBytes;
             long axisOff    = labelsOff + n;
             long leftOff    = axisOff + n;
