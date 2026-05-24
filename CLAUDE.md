@@ -57,34 +57,32 @@ Constants come from `normalization.json` and `mcc_risk.json`. Reference data is 
 
 ## The SCM_RIGHTS problem (critical)
 
-JDK's `java.net` UDS support does **not** expose `recvmsg()` ancillary data. We need to pull a raw TCP FD out of a `cmsg` and turn it into something we can read/write HTTP on. Options, ranked for Java 25:
+JDK's `java.net` UDS support does **not** expose `recvmsg()` ancillary data. We pull a raw TCP FD out of a `cmsg` using **Foreign Function & Memory API** (final since JDK 22, mature in 25):
 
-1. **Foreign Function & Memory API (final since JDK 22, mature in 25)** — call `recvmsg(2)` directly via a `Linker` downcall, parse the `cmsghdr`, recover the int FD. Convert to a `SocketChannel` either by writing the FD into a private `FileDescriptor` (reflective access to `sun.nio.ch.SocketChannelImpl`) or by mediating reads/writes through FFM `read`/`write` calls and serving HTTP off raw buffers. No build-time native step. **Default.**
-2. **Tiny JNI shim** — ~100 LoC of C wrapping `recvmsg()`. Fallback if FFM reflection into `sun.nio.ch` proves brittle on JDK 25.
-3. **Netty with native transport** — `EpollServerDomainSocketChannel` exists but has no built-in SCM_RIGHTS FD-receive path; still needs native code, and Netty itself eats into the RAM budget.
+- `recvmsg(2)` via `Linker` downcall, parse `cmsghdr` at offset +16 to extract int FD.
+- Reads/writes served via FFM `read`/`write` downcalls directly on the raw FD — no `SocketChannel` wrapping, no reflection into `sun.nio.ch`.
+- Pre-allocated message structs (`iov` 16 B, `cmsg` 24 B, `msg` 56 B) reused across requests.
+- 5-cycle FFM warm-up loop at startup to JIT-compile downcalls before real requests arrive.
 
-JVM flags required: `--enable-native-access=ALL-UNNAMED`. If reflecting into `sun.nio.ch`: `--add-opens=java.base/sun.nio.ch=ALL-UNNAMED`.
-
-Whatever path: once we have the int FD, immediately set `O_NONBLOCK`, register with a `Selector`/epoll loop, and never block a thread per connection.
+JVM flags required: `--enable-native-access=ALL-UNNAMED`. No `--add-opens` needed (we don't wrap as `SocketChannel`).
 
 ## Java service design
 
-- **JDK**: **Java 25 LTS** (September 2025). Two viable builds:
-  - **GraalVM for JDK 25 native-image** — preferred. Fastest cold start, lowest RSS, fits the 160 MB cap easily. FFM and Vector API both supported by native-image in this release line; verify your specific build (`native-image --version`).
-  - **OpenJDK 25 HotSpot** with AppCDS + `-XX:+UseCompactObjectHeaders` (JEP 519, **final in JDK 25** — 8 bytes off every Java object, real win against the 160 MB cap) and a small GC: `-XX:+UseSerialGC` for the cleanest pause profile at this heap size, or `-XX:+UseShenandoahGC -XX:ShenandoahGCMode=generational` (JEP 521, generational Shenandoah went final in 25) if allocation-rate spikes from JSON parsing hurt p99.
-- **No framework**. Hand-rolled HTTP/1.1 parser; we only handle two routes. Spring/Quarkus/Micronaut all blow the memory budget.
-- **Event loop**: single thread per API container running an epoll `Selector` over the received FDs. CPU budget is ~0.4 vCPU — one busy loop thread is right. Virtual threads are *not* the right tool here (one connection, one allocation each, churn hurts).
-- **JSON**: `dsl-json` or `jsoniter-scala` (compile-time codecs, no reflection, native-image friendly). Avoid Jackson.
-- **Module flags** (HotSpot): `--enable-native-access=ALL-UNNAMED`, `--add-modules=jdk.incubator.vector`, plus `--add-opens=java.base/sun.nio.ch=ALL-UNNAMED` only if we end up wrapping the received FD as a `SocketChannel`.
+- **JDK**: **Eclipse Temurin JDK 25 HotSpot** (runtime image `eclipse-temurin:25-jre`). GraalVM native-image was benchmarked and lost to JIT on the fraud-score hot path — HotSpot is the current choice. AppCDS and GC tuning are levers still available if needed: `-XX:+UseCompactObjectHeaders` (JEP 519, final in JDK 25) saves 8 B/object; `-XX:+UseSerialGC` for cleanest pause profile; `-XX:+UseShenandoahGC -XX:ShenandoahGCMode=generational` (JEP 521) if allocation spikes from JSON parsing hurt p99.
+- **No framework**. Hand-rolled HTTP/1.1 parser and response writer; only two routes. Spring/Quarkus/Micronaut blow the memory budget.
+- **Event loop**: single thread per API container (`accept()` → serve → `close()`). CPU budget is ~0.4 vCPU — one thread is right. Virtual threads are *not* the right tool here.
+- **JSON**: hand-written parsers — `JsonReader` (request body from `MemorySegment`) and `JsonStream` (streaming GZIP reader at build time). No external library; eliminates allocation and reflection.
+- **Response pre-building**: all 6 possible responses (`fraudCount` 0–5) are encoded to bytes at startup and written directly — zero allocation on the hot path.
+- **Module flags**: `--enable-native-access=ALL-UNNAMED --add-modules=jdk.incubator.vector`.
 - **Vector search**:
-  - Index built **once at startup** from `references.json.gz`. Don't ship a pre-built index — challenge forbids using test payloads as reference, but bundled reference data is fine.
-  - 3M × 14 × 4 bytes = 168 MB as flat float32 — half our per-container RAM. Reference vector components in `references.json.gz` have **at most 4 decimal places**, so store them as fixed-point `short` (int16) scaled by **10,000**: `s = round(f * 10000)`. All clamped dims are in `[0, 1]` → `[0, 10000]`; the `-1` null sentinel for dims 5/6 becomes `-10000`. Range fits comfortably in `short` (`[-32768, 32767]`). Storage: **3M × 14 × 2 bytes = 84 MB** as flat `short[]`, exact (no quantization loss), and SIMD-friendly via `ShortVector`.
-    - Memory-map a packed off-heap buffer (`MappedByteBuffer` or `Arena.allocateShared`) — keeps it out of GC.
-    - Share the index across api1/api2 via a read-only mmap of a file in the shared volume; build it in an init container.
-    - At query time, scale the incoming 14-dim vector the same way (`(short) round(v * 10000)`) and do L2 distance in `int` (square of differences fits: max `20000² × 14 ≈ 5.6e9`, use `long` accumulator to be safe). No float math on the hot path.
-  - Top-5 via **KD-Tree** over the 14-dim points. Exact nearest neighbors (matches reference behavior), `O(log n)` average per query versus `O(n)` brute force — the win on 3M points is large. Build once at boot from the flat point array; store the tree as parallel arrays (axis, split value as `short`, left/right indices) packed off-heap to avoid per-node object overhead.
-  - Implementation notes: median-of-medians or quickselect at build time; bounded-priority-queue (max-heap of size 5) during search; prune subtrees when axis-distance exceeds current top-5 worst. SIMD via the Vector API (`jdk.incubator.vector`, `ShortVector.SPECIES_PREFERRED`) on the per-leaf L2 distance — widen to `int` lanes for the squared-difference accumulator.
-  - 14 dims is near the edge where KD-Tree pruning degrades toward linear scan — measure. Fallbacks if pruning is ineffective: brute force with SIMD, or HNSW (jvector). Verify scoring parity against brute force before switching — neighbors must match closely or detection score tanks.
+  - Index built **at Docker image build time** by `rinha.index.BuildIndex` (a separate Dockerfile stage). Bundled as `/data/index.bin` in the runtime image. Never built at API startup.
+  - Fixed-point encoding: `s = (short) Math.round(f * 10000)`. Clamped dims `[0,1]` → `[0, 10000]`; null sentinel (`-1`) → `-10000`. Exact, no quantization loss.
+  - Storage layout: each point occupies **16 shorts** (14 dims + 2 padding for SIMD alignment), little-endian. Total: 3M × 16 × 2 B ≈ 96 MB points + ~3 MB tree metadata.
+  - Points are **memory-mapped off-heap** (`FileChannel.map` into `Arena.ofAuto`) — invisible to GC. Tree metadata (axis `byte[]`, left/right `int[]`, labels `byte[]`) is on-heap.
+  - Index binary format: 32-byte header (`RNHA` magic, version 2, point count, dims=14, root node), then points / labels / axis / left / right sections.
+  - **KD-Tree** built with quickselect + median-of-3 pivot. Search: bounded max-heap of size 5, prune subtrees when axis-distance² > current worst. Produces exact top-5 neighbors.
+  - **Distance kernel**: Vector API (`jdk.incubator.vector`, `ShortVector.SPECIES_PREFERRED` → `IntVector` widening for squared differences). Long accumulator to avoid overflow (`max 20000² × 14 ≈ 5.6e9`). Query vector encoded to shorts inline.
+  - 14 dims is near the KD-Tree pruning-degradation boundary — watch actual prune rates under load. Fallback if pruning collapses to linear scan: brute force with SIMD. Verify neighbor parity before switching.
 
 ## Scoring shape (what to optimize for)
 
@@ -95,66 +93,40 @@ Total ∈ [-6000, +6000], two independent components:
 
 Implication: under load, degrade gracefully (return *something* in budget) rather than erroring.
 
-## Repo layout (target)
+## Repo layout
 
 ```
 .
-├── docker-compose.yml          # only on `submission` branch, at root
+├── docker-compose.yml
 ├── api/
-│   ├── Dockerfile              # native-image build
-│   ├── pom.xml or build.gradle.kts
-│   └── src/main/java/...       # HTTP loop, parser, scorer, vector index, FFM bindings
-├── lb/
-│   └── Dockerfile              # builds SoNoForevis or pulls upstream image
-├── data/
-│   ├── references.json.gz
-│   ├── mcc_risk.json
-│   └── normalization.json
+│   ├── Dockerfile              # 3-stage: build (Maven) → indexer (BuildIndex) → runtime (JRE)
+│   ├── pom.xml                 # maven-compiler-plugin, no external deps
+│   └── src/main/
+│       ├── java/rinha/
+│       │   ├── Api.java                # FFM server loop, recvmsg, HTTP parse/write
+│       │   ├── KdTreeLoader.java       # background mmap loader, /ready state
+│       │   ├── FraudScoreHandler.java  # vector encoding, KD-tree search, response
+│       │   ├── Normalizer.java         # normalization constants & MCC risk table
+│       │   ├── ReadyHandler.java       # GET /ready responses
+│       │   └── index/
+│       │       └── BuildIndex.java     # offline: reads references.json.gz, writes index.bin
+│       └── resources/
+│           ├── references.json.gz
+│           ├── normalization.json
+│           └── mcc_risk.json
 └── participants/
     └── carlsonsantana.json     # submission metadata
 ```
 
 Branches: `main` = source; `submission` = artifacts with `docker-compose.yml` at root.
 
-## docker-compose sketch
+## docker-compose
 
-```yaml
-services:
-  api1:
-    build: ./api
-    environment:
-      CTRL_SOCK: /run/api1.ctrl
-      REFERENCES: /data/references.json.gz
-    volumes:
-      - sockets:/run
-      - ./data:/data:ro
-    deploy: { resources: { limits: { cpus: "0.425", memory: "160MB" } } }
+See `docker-compose.yml` at repo root for the authoritative version. Key points:
 
-  api2:
-    build: ./api
-    environment:
-      CTRL_SOCK: /run/api2.ctrl
-      REFERENCES: /data/references.json.gz
-    volumes:
-      - sockets:/run
-      - ./data:/data:ro
-    deploy: { resources: { limits: { cpus: "0.425", memory: "160MB" } } }
-
-  lb:
-    build: ./lb
-    environment:
-      PORT: "9999"
-      UPSTREAMS: /run/api1.ctrl,/run/api2.ctrl
-      WORKERS: "1"
-    ports: ["9999:9999"]
-    volumes: [ "sockets:/run" ]
-    depends_on: [ api1, api2 ]
-    deploy: { resources: { limits: { cpus: "0.15", memory: "30MB" } } }
-
-volumes:
-  sockets:
-    driver_opts: { type: tmpfs, device: tmpfs }
-```
+- `api1`, `api2`: built from `./api` (3-stage Dockerfile). Data files bundled into the image; no runtime mount of `references.json.gz`. Shared `sockets` tmpfs volume for `.ctrl` UDS files.
+- `lb`: SoNoForevis image. `UPSTREAMS=/run/api1.ctrl,/run/api2.ctrl`. Shares the same `sockets` volume.
+- Resource limits: lb `0.15 CPU / 30 MB`; each api `0.425 CPU / 160 MB`. Total ≤ 1 CPU / 350 MB.
 
 Network must be `bridge` (no `host`, no `privileged`). Images must be public linux/amd64.
 
@@ -165,14 +137,20 @@ Network must be `bridge` (no `host`, no `privileged`). Images must be public lin
 - "Using test payloads as reference or for fraud lookup is not allowed." Index is from the bundled `references.json.gz` only.
 - Deadline: **2026-06-05 23:59:59 UTC-3**. Trigger official test via a GitHub issue containing `rinha/test`.
 
-## First-pass milestones
+## Milestones (all done)
 
-1. Bare HTTP server on a normal TCP socket (no LB), `/ready` + `/fraud-score` returning a constant. Verify k6 can hit it.
-2. Load `references.json.gz`, convert each component to `short` via `round(f * 10000)`, build flat `short[]` index, brute-force top-5 with integer L2, real fraud_score. Verify detection score on a sample.
-3. Native-image build; check startup time and RSS fit under caps.
-4. JNI `recvmsg` shim; switch API from `ServerSocket` to FD-receive loop on `/run/apiN.ctrl`.
-5. Wire SoNoForevis in front, two replicas, run k6 end-to-end.
-6. Add Vector API SIMD (`ShortVector` → `IntVector` widening for squared diffs), profile hot path, tune GC / heap / `-Xmx`.
+1. ~~Bare HTTP server on a normal TCP socket, `/ready` + `/fraud-score` returning a constant.~~
+2. ~~Load `references.json.gz`, fixed-point encoding, KD-tree index, real fraud_score.~~
+3. ~~FFM `recvmsg` shim; FD-receive loop on `/run/apiN.ctrl`.~~
+4. ~~Wire SoNoForevis, two replicas, docker-compose end-to-end.~~
+5. ~~Vector API SIMD on distance kernel.~~
+
+## Remaining optimization levers
+
+- GC tuning: `-XX:+UseSerialGC` or generational Shenandoah; `-XX:+UseCompactObjectHeaders`.
+- AppCDS to cut JIT warm-up latency on cold start.
+- Heap sizing: explicit `-Xmx` to avoid JVM over-reserving in 160 MB container.
+- KD-tree pruning effectiveness: if prune rate degrades under load, consider brute force with SIMD over the full 3M points (cache-friendly flat scan may win at this dim count).
 
 ## Useful upstream pointers
 
