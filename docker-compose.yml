@@ -1,0 +1,46 @@
+services:
+  api1: &api
+    image: carlsonsantana/rinha-de-backend-2026-java
+    environment:
+      CTRL_SOCK: /run/sockets/api1.ctrl
+      INDEX_FILE: /data/index.bin
+    volumes:
+      - sockets:/run/sockets
+    cpuset: "0"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.425"
+          memory: "160MB"
+
+  api2:
+    <<: *api
+    environment:
+      CTRL_SOCK: /run/sockets/api2.ctrl
+    cpuset: "1"
+
+  lb:
+    image: jrblatt/so-no-forevis:v1.0.0
+    environment:
+      PORT: "9999"
+      UPSTREAMS: /run/sockets/api1,/run/sockets/api2
+      WORKERS: "1"
+    ports:
+      - "9999:9999"
+    volumes:
+      - sockets:/run/sockets
+    depends_on:
+      - api1
+      - api2
+    restart: on-failure
+    security_opt:
+      - seccomp=unconfined
+    cpuset: "2,3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.15"
+          memory: "30MB"
+
+volumes:
+  sockets:
