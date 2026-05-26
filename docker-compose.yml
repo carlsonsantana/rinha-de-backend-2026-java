@@ -23,7 +23,7 @@ services:
     image: jrblatt/so-no-forevis:v1.0.0
     environment:
       PORT: "9999"
-      UPSTREAMS: /run/sockets/api1,/run/sockets/api2
+      UPSTREAMS: /run/sockets/api1.ctrl,/run/sockets/api2.ctrl
       WORKERS: "1"
     ports:
       - "9999:9999"
