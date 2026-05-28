@@ -15,7 +15,7 @@ RUN mvn -B -q -DskipTests clean package
 FROM eclipse-temurin:25-jre AS indexer
 WORKDIR /app
 COPY --from=build-indexer /build/target/indexer.jar /app/indexer.jar
-COPY api/src/main/resources/references.json.gz  /data/references.json.gz
+COPY indexer/src/main/resources/references.json.gz  /data/references.json.gz
 COPY api/src/main/resources/normalization.json  /data/normalization.json
 COPY api/src/main/resources/mcc_risk.json       /data/mcc_risk.json
 RUN java -Xmx256m -jar /app/indexer.jar \

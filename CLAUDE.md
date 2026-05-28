@@ -111,7 +111,6 @@ Implication: under load, degrade gracefully (return *something* in budget) rathe
 │       │   └── index/
 │       │       └── BuildIndex.java     # offline: reads references.json.gz, writes index.bin
 │       └── resources/
-│           ├── references.json.gz
 │           ├── normalization.json
 │           └── mcc_risk.json
 └── participants/
