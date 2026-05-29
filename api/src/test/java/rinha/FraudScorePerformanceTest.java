@@ -1,13 +1,8 @@
 package rinha;
 
-import java.io.InputStream;
 import java.lang.foreign.MemorySegment;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.time.OffsetDateTime;
-import java.time.ZoneOffset;
 import java.util.Arrays;
 import java.util.Random;
 
@@ -15,12 +10,9 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 
-import rinha.index.BuildIndex;
-
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class FraudScorePerformanceTest {
@@ -43,23 +35,7 @@ class FraudScorePerformanceTest {
 
     @BeforeAll
     void setUp() throws Exception {
-        Path indexPath = ensureIndexBin();
-
-        KdTreeLoader loader = new KdTreeLoader(indexPath);
-        loader.startLoading();
-        long deadlineNs = System.nanoTime() + 60_000_000_000L;
-        while (!loader.isLoaded()) {
-            Throwable err = loader.getLoadError();
-            if (err != null) throw new IllegalStateException("kdtree load failed", err);
-            if (System.nanoTime() > deadlineNs) fail("kdtree load timed out");
-            Thread.sleep(50);
-        }
-
-        Normalizer norm = Normalizer.load(
-            Path.of("src/main/resources/normalization.json"),
-            Path.of("src/main/resources/mcc_risk.json"));
-
-        handler = new FraudScoreHandler(loader, norm);
+        handler = TestFixture.createHandler();
 
         Random rng = new Random(SEED);
         payloads = new MemorySegment[N_CALLS];
@@ -104,25 +80,6 @@ class FraudScorePerformanceTest {
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────
-
-    private static Path ensureIndexBin() throws Exception {
-        Path indexPath = Path.of("target", "index.bin");
-        if (Files.exists(indexPath) && Files.size(indexPath) > 0) return indexPath;
-
-        Files.createDirectories(indexPath.getParent());
-
-        Path refPath = Path.of("target", "test-references.json.gz");
-        try (InputStream in = FraudScorePerformanceTest.class
-                .getResourceAsStream("/references.json.gz")) {
-            if (in == null) throw new IllegalStateException(
-                "references.json.gz not on test classpath — "
-              + "run `mvn install` in ../indexer first");
-            Files.copy(in, refPath, StandardCopyOption.REPLACE_EXISTING);
-        }
-
-        BuildIndex.main(new String[]{refPath.toString(), indexPath.toString()});
-        return indexPath;
-    }
 
     private static byte[] buildHttpRequest(Random rng) {
         String  txTime    = BASE_TIME.minusHours(rng.nextInt(720)).toString();
