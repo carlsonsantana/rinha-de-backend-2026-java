@@ -67,7 +67,7 @@ public class Api {
         Normalizer norm = Normalizer.load(Path.of(normFile), Path.of(mccFile));
         System.out.println("[api] normalizer loaded");
 
-        KdTreeLoader loader = new KdTreeLoader(Path.of(indexFile));
+        IvfLoader loader = new IvfLoader(Path.of(indexFile));
         loader.startLoading();
 
         FraudScoreHandler fraudHandler = new FraudScoreHandler(loader, norm);
@@ -139,7 +139,7 @@ public class Api {
                               MemorySegment cmsg, MemorySegment reqBuf,
                               MemorySegment defaultSeg, MemorySegment readyOkSeg,
                               MemorySegment readyErrSeg, MemorySegment fraudBuf,
-                              KdTreeLoader loader, FraudScoreHandler fraudHandler) throws Throwable {
+                              IvfLoader loader, FraudScoreHandler fraudHandler) throws Throwable {
         while (true) {
             msg.fill((byte) 0);
             msg.set(ADDRESS,   16, iov);

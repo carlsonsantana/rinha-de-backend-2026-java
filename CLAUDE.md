@@ -75,14 +75,14 @@ JVM flags required: `--enable-native-access=ALL-UNNAMED`. No `--add-opens` neede
 - **Response pre-building**: all 6 possible responses (`fraudCount` 0–5) are encoded to bytes at startup and written directly — zero allocation on the hot path.
 - **Module flags**: `--enable-native-access=ALL-UNNAMED --add-modules=jdk.incubator.vector`.
 - **Vector search**:
-  - Index built **at Docker image build time** by `rinha.index.BuildIndex` (a separate Dockerfile stage). Bundled as `/data/index.bin` in the runtime image. Never built at API startup.
+  - Index built **at Docker image build time** by `rinha.index.BuildIndex` (in the `indexer/` Maven module). Bundled as `/data/index.bin` in the runtime image. Never built at API startup.
   - Fixed-point encoding: `s = (short) Math.round(f * 10000)`. Clamped dims `[0,1]` → `[0, 10000]`; null sentinel (`-1`) → `-10000`. Exact, no quantization loss.
-  - Storage layout: each point occupies **16 shorts** (14 dims + 2 padding for SIMD alignment), little-endian. Total: 3M × 16 × 2 B ≈ 96 MB points + ~3 MB tree metadata.
-  - Points are **memory-mapped off-heap** (`FileChannel.map` into `Arena.ofAuto`) — invisible to GC. Tree metadata (axis `byte[]`, left/right `int[]`, labels `byte[]`) is on-heap.
-  - Index binary format: 32-byte header (`RNHA` magic, version 2, point count, dims=14, root node), then points / labels / axis / left / right sections.
-  - **KD-Tree** built with quickselect + median-of-3 pivot. Search: bounded max-heap of size 5, prune subtrees when axis-distance² > current worst. Produces exact top-5 neighbors.
-  - **Distance kernel**: Vector API (`jdk.incubator.vector`, `ShortVector.SPECIES_PREFERRED` → `IntVector` widening for squared differences). Long accumulator to avoid overflow (`max 20000² × 14 ≈ 5.6e9`). Query vector encoded to shorts inline.
-  - 14 dims is near the KD-Tree pruning-degradation boundary — watch actual prune rates under load. Fallback if pruning collapses to linear scan: brute force with SIMD. Verify neighbor parity before switching.
+  - Storage layout: each point occupies **16 shorts** (14 dims + 2 padding for SIMD alignment), little-endian.
+  - Points and centroids are **memory-mapped off-heap** (`FileChannel.map` into `Arena.ofAuto`) — invisible to GC. Cluster offsets and labels are on-heap.
+  - Index binary format: 40-byte header (`RNHA` magic, version 3, point count, dims=14, K, maxClusterSize, 4 reserved ints), then: centroids (`K × 16 × 2` bytes), cluster offsets (`(K+1) × 4` bytes, LE ints), points (`n × 16 × 2` bytes, cluster-ordered), labels (`n` bytes, cluster-ordered).
+  - **IVF (Inverted File Index)** with k-means clustering. Build: K=2048 clusters, up to 10 Lloyd iterations, multi-threaded assignment, seeded RNG. At query time: find nearest `nprobe=4` centroids (tunable via `-Divf.nprobe`), then brute-force exact top-5 over only those clusters. Approximate search — excellent recall in practice, p99 ≈ 0.82 ms.
+  - **Distance kernel**: `ShortVector.SPECIES_256` (AVX2 256-bit) — subtract, widen short→int, square, combine pairs, widen int→long, reduce. Used for both centroid scan and cluster point scan. Long accumulator prevents overflow (`max 20000² × 16 lanes`).
+  - Top-5 maintained as a bounded max-heap (size 5); centroid candidates as a bounded max-heap (size nprobe). Both reused across requests (single-threaded, static arrays).
 
 ## Scoring shape (what to optimize for)
 
@@ -99,20 +99,22 @@ Implication: under load, degrade gracefully (return *something* in budget) rathe
 .
 ├── docker-compose.yml
 ├── api/
-│   ├── Dockerfile              # 3-stage: build (Maven) → indexer (BuildIndex) → runtime (JRE)
-│   ├── pom.xml                 # maven-compiler-plugin, no external deps
-│   └── src/main/
-│       ├── java/rinha/
+│   ├── Dockerfile              # single build stage (installs indexer → builds api) → indexer stage → runtime JRE
+│   ├── pom.xml                 # test dep on br.rinha:indexer:0.1.0 (test scope only)
+│   └── src/
+│       ├── main/java/rinha/
 │       │   ├── Api.java                # FFM server loop, recvmsg, HTTP parse/write
-│       │   ├── KdTreeLoader.java       # background mmap loader, /ready state
-│       │   ├── FraudScoreHandler.java  # vector encoding, KD-tree search, response
+│       │   ├── IvfLoader.java          # background mmap loader, /ready state
+│       │   ├── FraudScoreHandler.java  # vector encoding, IVF search, response
 │       │   ├── Normalizer.java         # normalization constants & MCC risk table
-│       │   ├── ReadyHandler.java       # GET /ready responses
-│       │   └── index/
-│       │       └── BuildIndex.java     # offline: reads references.json.gz, writes index.bin
-│       └── resources/
+│       │   └── ReadyHandler.java       # GET /ready responses
+│       └── main/resources/
 │           ├── normalization.json
 │           └── mcc_risk.json
+├── indexer/
+│   ├── pom.xml                 # standalone Maven module, no external deps
+│   └── src/main/java/rinha/index/
+│       └── BuildIndex.java     # offline: k-means IVF build, writes index.bin (version 3)
 └── participants/
     └── carlsonsantana.json     # submission metadata
 ```
@@ -123,7 +125,7 @@ Branches: `main` = source; `submission` = artifacts with `docker-compose.yml` at
 
 See `docker-compose.yml` at repo root for the authoritative version. Key points:
 
-- `api1`, `api2`: built from `./api` (3-stage Dockerfile). Data files bundled into the image; no runtime mount of `references.json.gz`. Shared `sockets` tmpfs volume for `.ctrl` UDS files.
+- `api1`, `api2`: built from `./api` (Dockerfile has a single `build` Maven stage — installs `indexer` module first so `api` can resolve it as a test dependency, then builds `api`; followed by an `indexer` stage that runs `BuildIndex`; then the runtime JRE stage). Data files bundled into the image; no runtime mount of `references.json.gz`. Shared `sockets` tmpfs volume for `.ctrl` UDS files.
 - `lb`: SoNoForevis image. `UPSTREAMS=/run/api1.ctrl,/run/api2.ctrl`. Shares the same `sockets` volume.
 - Resource limits: lb `0.15 CPU / 30 MB`; each api `0.425 CPU / 160 MB`. Total ≤ 1 CPU / 350 MB.
 
@@ -143,13 +145,15 @@ Network must be `bridge` (no `host`, no `privileged`). Images must be public lin
 3. ~~FFM `recvmsg` shim; FD-receive loop on `/run/apiN.ctrl`.~~
 4. ~~Wire SoNoForevis, two replicas, docker-compose end-to-end.~~
 5. ~~Vector API SIMD on distance kernel.~~
+6. ~~Replace KD-Tree with IVF k-means (K=2048, nprobe=4); p99 ≈ 0.82 ms, 148/148 correctness.~~
 
 ## Remaining optimization levers
 
 - GC tuning: `-XX:+UseSerialGC` or generational Shenandoah; `-XX:+UseCompactObjectHeaders`.
 - AppCDS to cut JIT warm-up latency on cold start.
 - Heap sizing: explicit `-Xmx` to avoid JVM over-reserving in 160 MB container.
-- KD-tree pruning effectiveness: if prune rate degrades under load, consider brute force with SIMD over the full 3M points (cache-friendly flat scan may win at this dim count).
+- IVF tuning: increase `nprobe` for better recall at cost of latency; increase K for smaller clusters (faster scan); OPQ/PQ residual compression if memory becomes tight.
+- Centroid scan (K=2048 × 16 shorts) is a flat SIMD sweep — already cache-friendly. Cluster scan (nprobe × avg_cluster_size ≈ 4 × 1500 points) is the hot inner loop; pre-sorting clusters by access frequency could improve cache warmth.
 
 ## Useful upstream pointers
 

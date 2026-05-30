@@ -52,18 +52,22 @@ public final class FraudScoreHandler {
         "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     ).getBytes();
 
-    private final KdTreeLoader loader;
-    private final Normalizer   norm;
+    // How many centroids to probe per query. Higher → better recall, slower.
+    private static final int NPROBE = Integer.parseInt(
+        System.getProperty("ivf.nprobe", "4"));
+
+    private final IvfLoader  loader;
+    private final Normalizer norm;
+
+    // Top-5 max-heap (worst dist at index 0); reused across calls (single-threaded).
     private static final long[] dists = {Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE};
     private static final int[]  nodes = new int[5];
 
-    // Explicit stack for iterative KD-tree search; each entry is a deferred
-    // far-branch check. Depth = tree depth ≈ log₂(3M) ≈ 22; 64 is generous.
-    private static final int    STACK_CAP  = 64;
-    private static final int[]  stackNode  = new int[STACK_CAP];
-    private static final long[] stackBound = new long[STACK_CAP];
+    // Top-NPROBE max-heap for centroid selection.
+    private static final long[] probeDists = new long[NPROBE];
+    private static final int[]  probeIds   = new int[NPROBE];
 
-    public FraudScoreHandler(KdTreeLoader loader, Normalizer norm) {
+    public FraudScoreHandler(IvfLoader loader, Normalizer norm) {
         this.loader = loader;
         this.norm   = norm;
     }
@@ -85,8 +89,8 @@ public final class FraudScoreHandler {
         ParsedRequest p = parseRequest(new JsonReader(reqBuf, bodyStart, bytesRead));
         short[] query   = computeVector(p);
 
-        KdTreeLoader.KdTreeData tree = loader.getContent();
-        return RESPONSES[countFrauds(tree, query)];
+        IvfLoader.IvfData ivf = loader.getContent();
+        return RESPONSES[countFrauds(ivf, query)];
     }
 
     // ── body location ───────────────────────────────────────────────────────
@@ -145,24 +149,47 @@ public final class FraudScoreHandler {
         return (short) Math.round(v * SCALE);
     }
 
-    // ── KD-tree nearest-5 search ────────────────────────────────────────────
+    // ── IVF approximate top-5 search ────────────────────────────────────────
 
-    private static int countFrauds(KdTreeLoader.KdTreeData tree, short[] query) {
-        search(tree, tree.root(), query);
+    private static int countFrauds(IvfLoader.IvfData ivf, short[] query) {
+        for (int i = 0; i < 5; i++)      dists[i]      = Long.MAX_VALUE;
+        for (int i = 0; i < NPROBE; i++) probeDists[i] = Long.MAX_VALUE;
+
+        // 1. Find nearest NPROBE centroids.
+        MemorySegment centroids = ivf.centroids();
+        int k = ivf.k();
+        for (int c = 0; c < k; c++) {
+            long base = (long) c * DIMS_STORED * 2;
+            long d    = distSqSimd(query, centroids, base);
+            probePush(d, c);
+        }
+
+        // 2. Brute-force top-5 over the points in those clusters.
+        int[]         offset = ivf.clusterOffset();
+        MemorySegment points = ivf.points();
+        for (int p = 0; p < NPROBE; p++) {
+            int c   = probeIds[p];
+            int lo  = offset[c];
+            int hi  = offset[c + 1];
+            long byteOff = (long) lo * DIMS_STORED * 2;
+            for (int node = lo; node < hi; node++, byteOff += DIMS_STORED * 2) {
+                long d = distSqSimd(query, points, byteOff);
+                topPush(d, node);
+            }
+        }
+
+        // 3. Count frauds among the top-5 (labels are cluster-ordered too).
+        byte[] labels = ivf.labels();
         int frauds = 0;
-        for (int i = 0; i < 5; i++)
-            if (tree.labels()[nodes[i]] == 1) frauds++;
-        dists[0] = Long.MAX_VALUE;
-        dists[1] = Long.MAX_VALUE;
-        dists[2] = Long.MAX_VALUE;
-        dists[3] = Long.MAX_VALUE;
-        dists[4] = Long.MAX_VALUE;
+        for (int i = 0; i < 5; i++) {
+            if (labels[nodes[i]] == 1) frauds++;
+        }
         return frauds;
     }
 
-    private static long distSqSimd(short[] query, MemorySegment points, long byteOffset) {
+    private static long distSqSimd(short[] query, MemorySegment data, long byteOffset) {
         ShortVector q    = ShortVector.fromArray(S_S256, query, 0);
-        ShortVector p    = ShortVector.fromMemorySegment(S_S256, points, byteOffset,
+        ShortVector p    = ShortVector.fromMemorySegment(S_S256, data, byteOffset,
                                                          ByteOrder.LITTLE_ENDIAN);
         ShortVector diff = q.sub(p); // diff ∈ [-20000, 20000], fits in short
 
@@ -181,42 +208,8 @@ public final class FraudScoreHandler {
         return lo.add(hi).reduceLanes(VectorOperators.ADD);
     }
 
-    private static void search(KdTreeLoader.KdTreeData tree, int rootId, short[] query) {
-        int nodeId = rootId;
-        int sp = 0;
-
-        while (true) {
-            // Pop deferred far-branches until we land on a node worth visiting.
-            // The prune bound is re-checked here (not at push) because dists[0]
-            // may have improved while the near subtree was being explored.
-            while (nodeId < 0) {
-                if (sp == 0) return;
-                sp--;
-                nodeId = stackNode[sp];
-                if (stackBound[sp] >= dists[0]) nodeId = -1;
-            }
-
-            long base   = (long) nodeId * DIMS_STORED * 2;
-            long distSq = distSqSimd(query, tree.points(), base);
-            heapPush(distSq, nodeId);
-
-            int  axis     = tree.axis()[nodeId] & 0xFF;
-            long axisDiff = (long) query[axis] - tree.pointAt(nodeId, axis);
-            int  near     = axisDiff <= 0 ? tree.left()[nodeId]  : tree.right()[nodeId];
-            int  far      = axisDiff <= 0 ? tree.right()[nodeId] : tree.left()[nodeId];
-
-            if (far >= 0) {
-                stackNode[sp]  = far;
-                stackBound[sp] = axisDiff * axisDiff;
-                sp++;
-            }
-
-            nodeId = near;
-        }
-    }
-
-    // Max-heap of capacity 5: dists[0] is always the worst (largest) distance.
-    private static void heapPush(long dist, int nodeId) {
+    // Max-heap capacity 5: dists[0] is always the largest of the kept top-5.
+    private static void topPush(long dist, int nodeId) {
         if (dist < dists[0]) {
             dists[0] = dist;
             nodes[0] = nodeId;
@@ -226,15 +219,29 @@ public final class FraudScoreHandler {
                 if (l < 5 && dists[l] > dists[max]) max = l;
                 if (r < 5 && dists[r] > dists[max]) max = r;
                 if (max == i) break;
-                swap(i, max);
+                long td = dists[i]; dists[i] = dists[max]; dists[max] = td;
+                int  tn = nodes[i]; nodes[i] = nodes[max]; nodes[max] = tn;
                 i = max;
             }
         }
     }
 
-    private static void swap(int a, int b) {
-        long td = dists[a]; dists[a] = dists[b]; dists[b] = td;
-        int  tn = nodes[a]; nodes[a] = nodes[b]; nodes[b] = tn;
+    // Max-heap capacity NPROBE: probeDists[0] is the worst centroid distance kept.
+    private static void probePush(long dist, int centroidId) {
+        if (dist < probeDists[0]) {
+            probeDists[0] = dist;
+            probeIds[0]   = centroidId;
+            int i = 0;
+            while (true) {
+                int l = (i << 1) | 1, r = l + 1, max = i;
+                if (l < NPROBE && probeDists[l] > probeDists[max]) max = l;
+                if (r < NPROBE && probeDists[r] > probeDists[max]) max = r;
+                if (max == i) break;
+                long td = probeDists[i]; probeDists[i] = probeDists[max]; probeDists[max] = td;
+                int  ti = probeIds[i];   probeIds[i]   = probeIds[max];   probeIds[max]   = ti;
+                i = max;
+            }
+        }
     }
 
     // ── request parsing ─────────────────────────────────────────────────────

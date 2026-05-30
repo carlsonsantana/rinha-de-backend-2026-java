@@ -16,9 +16,9 @@ public final class ReadyHandler {
         "\r\n"
     ).getBytes();
 
-    private final KdTreeLoader loader;
+    private final IvfLoader loader;
 
-    public ReadyHandler(KdTreeLoader loader) {
+    public ReadyHandler(IvfLoader loader) {
         this.loader = loader;
     }
 

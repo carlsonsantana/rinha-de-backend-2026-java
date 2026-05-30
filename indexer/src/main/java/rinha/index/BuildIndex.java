@@ -8,6 +8,8 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.Arrays;
+import java.util.Random;
 import java.util.zip.GZIPInputStream;
 
 public final class BuildIndex {
@@ -16,8 +18,12 @@ public final class BuildIndex {
     private static final int DIMS_STORED = 16; // 14 dims + 2 zero shorts for 16-lane SIMD alignment
     private static final int SCALE       = 10_000;
     private static final int MAGIC       = ('R') | ('N' << 8) | ('H' << 16) | ('A' << 24);
-    private static final int VERSION     = 2;
-    private static final int HEADER_BYTES = 32;
+    private static final int VERSION     = 3;
+    private static final int HEADER_BYTES = 40;
+
+    private static final int  DEFAULT_K   = 2048;
+    private static final int  MAX_ITERS   = 10;
+    private static final long SEED        = 42L;
 
     public static void main(String[] args) throws Exception {
         if (args.length != 2) {
@@ -34,13 +40,16 @@ public final class BuildIndex {
         System.out.printf("[index] parsed %,d points (%.2fs)%n",
             loaded.n, (t1 - t0) / 1e9);
 
-        System.out.println("[index] building KD-Tree");
-        Tree tree = build(loaded);
+        int k = Integer.parseInt(System.getenv().getOrDefault("INDEX_K", Integer.toString(DEFAULT_K)));
+        int threads = Math.max(1, Runtime.getRuntime().availableProcessors());
+        System.out.printf("[index] k-means K=%d threads=%d%n", k, threads);
+
+        Kmeans km = kmeans(loaded, k, threads);
         long t2 = System.nanoTime();
-        System.out.printf("[index] built tree (%.2fs)%n", (t2 - t1) / 1e9);
+        System.out.printf("[index] built clusters (%.2fs)%n", (t2 - t1) / 1e9);
 
         System.out.println("[index] writing " + out);
-        long bytes = write(out, loaded, tree);
+        long bytes = write(out, loaded, km);
         long t3 = System.nanoTime();
         System.out.printf("[index] wrote %,d bytes (%.2fs, total %.2fs)%n",
             bytes, (t3 - t2) / 1e9, (t3 - t0) / 1e9);
@@ -49,7 +58,7 @@ public final class BuildIndex {
     // ---------- parse ----------
 
     static final class Loaded {
-        short[] points;
+        short[] points; // packed: n × DIMS shorts
         byte[] labels;
         int n;
     }
@@ -141,104 +150,183 @@ public final class BuildIndex {
         return (short) s;
     }
 
-    // ---------- KD-Tree build ----------
+    // ---------- k-means (IVF) ----------
 
-    static final class Tree {
-        int[] permutation; // permutation[nodeId] = original point index
-        byte[] axis;
-        int[] left;
-        int[] right;
-        int root;
+    static final class Kmeans {
+        int k;
+        short[] centroids;       // k × DIMS shorts (packed)
+        int[]   clusterSize;     // k
+        int[]   clusterOffset;   // k + 1 (prefix sum)
+        int[]   permutation;     // n: cluster-order index → original index
     }
 
-    static Tree build(Loaded data) {
+    static Kmeans kmeans(Loaded data, int k, int nThreads) {
         int n = data.n;
-        int[] idx = new int[n];
-        for (int i = 0; i < n; i++) idx[i] = i;
+        Random rng = new Random(SEED);
+        short[] points = data.points;
 
-        Tree t = new Tree();
-        t.permutation = new int[n];
-        t.axis = new byte[n];
-        t.left = new int[n];
-        t.right = new int[n];
-
-        Builder b = new Builder(data.points, idx, t);
-        t.root = b.buildNode(0, n - 1, 0);
-        if (b.nextId != n) {
-            throw new IllegalStateException("tree size mismatch: " + b.nextId + " != " + n);
+        // Init: k distinct random points via partial Fisher-Yates over a small swap table.
+        // We don't materialize the full index array — just pick distinct ints.
+        short[] centroids = new short[k * DIMS];
+        boolean[] picked = new boolean[n];
+        for (int c = 0; c < k; c++) {
+            int idx;
+            do { idx = rng.nextInt(n); } while (picked[idx]);
+            picked[idx] = true;
+            System.arraycopy(points, idx * DIMS, centroids, c * DIMS, DIMS);
         }
-        return t;
+        picked = null;
+
+        int[]  assignment = new int[n];
+        Arrays.fill(assignment, -1);
+        long[] sums   = new long[k * DIMS];
+        int[]  counts = new int[k];
+
+        for (int iter = 0; iter < MAX_ITERS; iter++) {
+            int changes = assignParallel(points, n, centroids, k, assignment, nThreads);
+
+            Arrays.fill(sums, 0L);
+            Arrays.fill(counts, 0);
+            for (int i = 0; i < n; i++) {
+                int c = assignment[i];
+                counts[c]++;
+                int pBase = i * DIMS;
+                int cBase = c * DIMS;
+                for (int d = 0; d < DIMS; d++) sums[cBase + d] += points[pBase + d];
+            }
+
+            int empty = 0;
+            for (int c = 0; c < k; c++) {
+                if (counts[c] == 0) {
+                    int rnd = rng.nextInt(n);
+                    System.arraycopy(points, rnd * DIMS, centroids, c * DIMS, DIMS);
+                    empty++;
+                } else {
+                    int cBase = c * DIMS;
+                    int cnt = counts[c];
+                    for (int d = 0; d < DIMS; d++) {
+                        centroids[cBase + d] = (short)(sums[cBase + d] / cnt);
+                    }
+                }
+            }
+
+            System.out.printf("[index]   iter %d: changes=%,d empty=%d%n", iter, changes, empty);
+            if (changes == 0 && empty == 0) {
+                System.out.println("[index]   converged");
+                break;
+            }
+        }
+
+        // Final assignment (centroids may have moved one last time).
+        assignParallel(points, n, centroids, k, assignment, nThreads);
+        Arrays.fill(counts, 0);
+        for (int i = 0; i < n; i++) counts[assignment[i]]++;
+
+        int[] offset = new int[k + 1];
+        for (int c = 0; c < k; c++) offset[c + 1] = offset[c] + counts[c];
+
+        int[] cursors = new int[k];
+        int[] permutation = new int[n];
+        for (int i = 0; i < n; i++) {
+            int c = assignment[i];
+            permutation[offset[c] + cursors[c]++] = i;
+        }
+
+        // Report cluster balance.
+        int min = Integer.MAX_VALUE, max = 0;
+        long total = 0;
+        for (int c = 0; c < k; c++) {
+            if (counts[c] < min) min = counts[c];
+            if (counts[c] > max) max = counts[c];
+            total += counts[c];
+        }
+        System.out.printf("[index] cluster size: min=%d max=%d avg=%.1f%n",
+            min, max, total / (double) k);
+
+        Kmeans km = new Kmeans();
+        km.k = k;
+        km.centroids = centroids;
+        km.clusterSize = counts;
+        km.clusterOffset = offset;
+        km.permutation = permutation;
+        return km;
     }
 
-    static final class Builder {
-        final short[] points;
-        final int[] idx;
-        final Tree t;
-        int nextId;
-
-        Builder(short[] points, int[] idx, Tree t) {
-            this.points = points;
-            this.idx = idx;
-            this.t = t;
+    private static int assignParallel(short[] points, int n, short[] centroids, int k,
+                                      int[] assignment, int nThreads) {
+        if (nThreads <= 1) {
+            return assignRange(points, 0, n, centroids, k, assignment);
         }
-
-        int buildNode(int lo, int hi, int depth) {
-            if (lo > hi) return -1;
-            int axis = depth % DIMS;
-            int mid = (lo + hi) >>> 1;
-            quickselect(lo, hi, mid, axis);
-            int id = nextId++;
-            t.axis[id] = (byte) axis;
-            t.permutation[id] = idx[mid];
-            t.left[id] = buildNode(lo, mid - 1, depth + 1);
-            t.right[id] = buildNode(mid + 1, hi, depth + 1);
-            return id;
+        int[] changes = new int[nThreads];
+        Thread[] threads = new Thread[nThreads];
+        int chunk = (n + nThreads - 1) / nThreads;
+        for (int t = 0; t < nThreads; t++) {
+            final int tid = t;
+            final int lo = t * chunk;
+            final int hi = Math.min(n, lo + chunk);
+            if (lo >= hi) continue;
+            threads[t] = new Thread(() ->
+                changes[tid] = assignRange(points, lo, hi, centroids, k, assignment),
+                "kmeans-" + tid);
+            threads[t].start();
         }
+        try {
+            for (Thread th : threads) if (th != null) th.join();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(e);
+        }
+        int total = 0;
+        for (int c : changes) total += c;
+        return total;
+    }
 
-        void quickselect(int lo, int hi, int k, int axis) {
-            while (lo < hi) {
-                int p = partition(lo, hi, axis);
-                if (k <= p) hi = p;
-                else lo = p + 1;
+    private static int assignRange(short[] points, int lo, int hi,
+                                   short[] centroids, int k, int[] assignment) {
+        int changes = 0;
+        for (int i = lo; i < hi; i++) {
+            int best = nearestCentroid(points, i * DIMS, centroids, k);
+            if (assignment[i] != best) {
+                assignment[i] = best;
+                changes++;
             }
         }
+        return changes;
+    }
 
-        int partition(int lo, int hi, int axis) {
-            int mid = (lo + hi) >>> 1;
-            short pivot = medianOf3(
-                axisVal(idx[lo], axis),
-                axisVal(idx[mid], axis),
-                axisVal(idx[hi], axis));
-            int i = lo - 1, j = hi + 1;
-            while (true) {
-                do i++; while (axisVal(idx[i], axis) < pivot);
-                do j--; while (axisVal(idx[j], axis) > pivot);
-                if (i >= j) return j;
-                int tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp;
+    private static int nearestCentroid(short[] points, int pOff, short[] centroids, int k) {
+        int  best     = 0;
+        long bestDist = Long.MAX_VALUE;
+        for (int c = 0; c < k; c++) {
+            int cOff = c * DIMS;
+            long d = 0;
+            for (int dim = 0; dim < DIMS; dim++) {
+                int diff = points[pOff + dim] - centroids[cOff + dim];
+                d += (long) diff * diff;
+            }
+            if (d < bestDist) {
+                bestDist = d;
+                best     = c;
             }
         }
-
-        short axisVal(int origIdx, int axis) {
-            return points[origIdx * DIMS + axis];
-        }
-
-        static short medianOf3(short a, short b, short c) {
-            if (a > b) { short t = a; a = b; b = t; }
-            if (b > c) { short t = b; b = c; c = t; }
-            if (a > b) { short t = a; a = b; b = t; }
-            return b;
-        }
+        return best;
     }
 
     // ---------- write ----------
 
-    static long write(Path out, Loaded data, Tree tree) throws IOException {
+    static long write(Path out, Loaded data, Kmeans km) throws IOException {
         int n = data.n;
-        long pointsBytes = (long) n * DIMS_STORED * 2;
-        long labelsBytes = n;
-        long axisBytes = n;
-        long childBytes = (long) n * 4;
-        long total = HEADER_BYTES + pointsBytes + labelsBytes + axisBytes + 2 * childBytes;
+        int k = km.k;
+        int maxClusterSize = 0;
+        for (int c = 0; c < k; c++) {
+            if (km.clusterSize[c] > maxClusterSize) maxClusterSize = km.clusterSize[c];
+        }
+
+        long centroidsBytes = (long) k * DIMS_STORED * 2;
+        long offsetsBytes   = (long)(k + 1) * 4;
+        long pointsBytes    = (long) n * DIMS_STORED * 2;
+        long labelsBytes    = n;
+        long total = HEADER_BYTES + centroidsBytes + offsetsBytes + pointsBytes + labelsBytes;
 
         try (FileChannel ch = FileChannel.open(out,
                 StandardOpenOption.CREATE,
@@ -250,10 +338,30 @@ public final class BuildIndex {
             header.putInt(VERSION);
             header.putInt(n);
             header.putInt(DIMS);
-            header.putInt(tree.root);
-            header.putInt(0).putInt(0).putInt(0);
+            header.putInt(k);
+            header.putInt(maxClusterSize);
+            // 16 bytes reserved
+            header.putInt(0).putInt(0).putInt(0).putInt(0);
             header.flip();
             drain(ch, header);
+
+            ByteBuffer cBuf = ByteBuffer.allocateDirect(1 << 17).order(ByteOrder.LITTLE_ENDIAN);
+            int centsPerChunk = cBuf.capacity() / (DIMS_STORED * 2);
+            for (int i = 0; i < k; ) {
+                int end = Math.min(k, i + centsPerChunk);
+                cBuf.clear();
+                for (int j = i; j < end; j++) {
+                    int base = j * DIMS;
+                    for (int d = 0; d < DIMS; d++) cBuf.putShort(km.centroids[base + d]);
+                    cBuf.putShort((short) 0);
+                    cBuf.putShort((short) 0);
+                }
+                cBuf.flip();
+                drain(ch, cBuf);
+                i = end;
+            }
+
+            writeInts(ch, km.clusterOffset);
 
             ByteBuffer pBuf = ByteBuffer.allocateDirect(1 << 18).order(ByteOrder.LITTLE_ENDIAN);
             int pointsPerChunk = pBuf.capacity() / (DIMS_STORED * 2);
@@ -261,11 +369,11 @@ public final class BuildIndex {
                 int end = Math.min(n, i + pointsPerChunk);
                 pBuf.clear();
                 for (int j = i; j < end; j++) {
-                    int orig = tree.permutation[j];
+                    int orig = km.permutation[j];
                     int base = orig * DIMS;
                     for (int d = 0; d < DIMS; d++) pBuf.putShort(data.points[base + d]);
-                    pBuf.putShort((short) 0); // SIMD padding lane 14
-                    pBuf.putShort((short) 0); // SIMD padding lane 15
+                    pBuf.putShort((short) 0);
+                    pBuf.putShort((short) 0);
                 }
                 pBuf.flip();
                 drain(ch, pBuf);
@@ -276,15 +384,11 @@ public final class BuildIndex {
             for (int i = 0; i < n; ) {
                 int end = Math.min(n, i + lBuf.capacity());
                 lBuf.clear();
-                for (int j = i; j < end; j++) lBuf.put(data.labels[tree.permutation[j]]);
+                for (int j = i; j < end; j++) lBuf.put(data.labels[km.permutation[j]]);
                 lBuf.flip();
                 drain(ch, lBuf);
                 i = end;
             }
-
-            drain(ch, ByteBuffer.wrap(tree.axis));
-            writeInts(ch, tree.left);
-            writeInts(ch, tree.right);
 
             long written = ch.position();
             if (written != total) {
@@ -464,4 +568,3 @@ public final class BuildIndex {
         @Override public void close() throws IOException { in.close(); }
     }
 }
-
