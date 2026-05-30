@@ -1,6 +1,6 @@
 services:
   api1: &api
-    image: carlsonsantana/rinha-de-backend-2026-java:latest
+    image: carlsonsantana/rinha-de-backend-2026-java:v1.0.4
     environment:
       API_CTRL_SOCK: /run/sockets/api1.ctrl
       INDEX_FILE: /data/index.bin
@@ -20,7 +20,7 @@ services:
     cpuset: "1"
 
   lb:
-    image: carlsonsantana/rinha-de-backend-2026-lb:latest
+    image: carlsonsantana/rinha-de-backend-2026-lb:v1.0.4
     environment:
       PORT: "9999"
       WORKERS: /run/sockets/api1.ctrl,/run/sockets/api2.ctrl
