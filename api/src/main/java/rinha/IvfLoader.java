@@ -96,6 +96,14 @@ public final class IvfLoader {
             MemorySegment points    = mapped.asSlice(pointsOff, pointsBytes);
             byte[]        labels    = mapped.asSlice(labelsOff, n).toArray(ValueLayout.JAVA_BYTE);
 
+            /* Pre-fault mmap'd pages before marking ready.
+             * Centroids (65 KB, 16 pages): scanned on every query — must be warm.
+             * Points (96 MB): sequential prefetch eliminates per-query page-fault spikes. */
+            for (long off = 0; off < centroidsBytes; off += 4096)
+                centroids.get(ValueLayout.JAVA_SHORT, off);
+            for (long off = 0; off < pointsBytes; off += 4096)
+                points.get(ValueLayout.JAVA_SHORT, off);
+
             data.set(new IvfData(n, k, maxClusterSize, centroids, offset, points, labels));
             loaded = true;
             System.out.printf("[ivf] loaded %,d points / %,d clusters from %s%n",

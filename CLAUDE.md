@@ -7,29 +7,32 @@ API in Java, fronted by a custom C load balancer (`lb/`) built with epoll.
 
 ```
 client → :9999 → lb (C, epoll, single-thread)
-                   ├─ /run/sockets/api1.sock ──▶ api1 (JVM, persistent UDS conn)
-                   └─ /run/sockets/api2.sock ──▶ api2 (JVM, persistent UDS conn)
+                   ├─ SCM_RIGHTS over /run/sockets/api1.ctrl ──▶ api1 (JVM)
+                   └─ SCM_RIGHTS over /run/sockets/api2.ctrl ──▶ api2 (JVM)
 ```
 
-The LB owns both UDS files (`bind`/`listen`). Each API worker connects into the LB at startup and maintains **one persistent UDS connection**. The LB byte-proxies TCP traffic to workers via a length-prefixed frame protocol — no FD passing, no `security_opt`.
+Each API owns its UDS file (`bind`/`listen` on `/run/sockets/apiN.ctrl`). The LB connects to the APIs' ctrl sockets at startup and maintains **one persistent ctrl connection per worker**. On each TCP accept the LB picks a worker (round-robin), calls `sendmsg(SCM_RIGHTS)` to hand the raw TCP fd to it in a single syscall, then closes its own copy. The LB never reads or writes HTTP bytes. Each API calls `recvmsg` to recover the TCP fd and serves HTTP/1.1 directly on it.
 
-### Wire protocol (LB ↔ API, little-endian)
+### Control-plane protocol (LB → API)
 
 ```
-[u32 LE length][payload bytes]
+sendmsg: [1-byte inline payload 'F'][cmsghdr SCM_RIGHTS: int tcp_fd]
 ```
 
-- **Request**: LB reads the full HTTP request from TCP (parsing `Content-Length` to find the boundary), sends it to the worker as one frame.
-- **Response**: Java writes a framed HTTP response; LB reads it, strips the frame header, writes the raw HTTP bytes to the TCP client.
+The 1-byte payload satisfies the kernel's `iovlen > 0` requirement. The cmsghdr layout on Linux x86_64 is 16-byte header (cmsg_len, cmsg_level, cmsg_type) + 4-byte fd at offset +16, padded to 24 bytes (`CMSG_SPACE(sizeof(int))`).
+
+### LB startup ordering
+
+The LB blocks synchronously (50 ms retry loop) until `connect()` to all worker ctrl sockets succeeds. Only then does it call `bind()`/`listen()` on `:9999`. This eliminates the startup race: by the time the first TCP accept can fire, all workers are live. No healthchecks or container-level coordination needed.
 
 ### LB worker FSM
 
-Each worker slot is `WAIT → IDLE → BUSY`. Only one request is in-flight per worker at a time — the next frame the LB reads from a worker's UDS is unambiguously the response for that worker's current TCP client. No request IDs needed; mixing is structurally impossible.
+Each worker slot is either **connected** (`ctrl_fd ≥ 0`) or **disconnected** (pending reconnect via timerfd). On TCP accept, if no worker is connected, LB writes 503 and closes. Cross-wiring is structurally impossible — each TCP fd lives in exactly one worker's process for its lifetime.
 
 ### Components
 
-- **lb**: built from `./lb` (Alpine + musl static build → `scratch` image). Single-thread epoll loop. Env: `PORT=9999`, `UPSTREAMS=/run/sockets/api1.sock,/run/sockets/api2.sock`. No `security_opt` required (uses epoll, not io_uring).
-- **api1, api2**: identical Java services. Each connects to its UDS at startup and runs a `readFrame → handle → writeFrame` loop. Env: `LB_SOCK=/run/sockets/api{1,2}.sock`.
+- **lb**: built from `./lb` (Alpine + musl static build → `scratch` image). Single-thread epoll loop. Env: `PORT=9999`, `WORKERS=/run/sockets/api1.ctrl,/run/sockets/api2.ctrl`. No `security_opt` required (SCM_RIGHTS over UDS is not blocked by default Docker seccomp).
+- **api1, api2**: identical Java services. Each binds its ctrl UDS at startup, accepts the LB's persistent connection, then loops: `recvmsg(tcp_fd)` → parse HTTP/1.1 → fraud-score / ready → write response → `close(tcp_fd)`. Env: `API_CTRL_SOCK=/run/sockets/api{1,2}.ctrl`.
 
 ### Resource budget (hard cap, sum of all containers ≤ 1 CPU / 350 MB)
 
@@ -71,8 +74,8 @@ Constants come from `normalization.json` and `mcc_risk.json`. Reference data is 
 
 - **JDK**: **Eclipse Temurin JDK 25 HotSpot** (runtime image `eclipse-temurin:25-jre`). GraalVM native-image was benchmarked and lost to JIT on the fraud-score hot path — HotSpot is the current choice. AppCDS and GC tuning are levers still available if needed: `-XX:+UseCompactObjectHeaders` (JEP 519, final in JDK 25) saves 8 B/object; `-XX:+UseSerialGC` for cleanest pause profile; `-XX:+UseShenandoahGC -XX:ShenandoahGCMode=generational` (JEP 521) if allocation spikes from JSON parsing hurt p99.
 - **No framework**. Hand-rolled HTTP/1.1 parser and response writer; only two routes. Spring/Quarkus/Micronaut blow the memory budget.
-- **Event loop**: single thread per API container (connect → framed read/write loop). CPU budget is ~0.4 vCPU — one thread is right. Virtual threads are *not* the right tool here.
-- **FFM I/O**: `Api.java` uses JDK 25 Foreign Function & Memory API (`Linker` downcalls) for `socket`/`connect`/`read`/`write`/`close` — same approach as before, just no `recvmsg`/`bind`/`listen`/`accept`. 5-cycle warm-up loop at startup JIT-compiles the stubs.
+- **Event loop**: single thread per API container (bind ctrl UDS → accept LB → recvmsg loop). CPU budget is ~0.4 vCPU — one thread is right. Virtual threads are *not* the right tool here.
+- **FFM I/O**: `Api.java` uses JDK 25 Foreign Function & Memory API (`Linker` downcalls) for `socket`/`bind`/`listen`/`accept4`/`recvmsg`/`unlink`/`read`/`write`/`close`. `recvmsg` recovers the TCP fd from `cmsghdr` at offset +16 (`MSG_CMSG_CLOEXEC` flag). Pre-allocated `msghdr`/`iovec`/`cbuf` structs are reused across requests; `msg_controllen` is reset to 24 before each call (kernel overwrites it). 5-cycle warm-up loop at startup JIT-compiles the stubs.
 - **JSON**: hand-written parsers — `JsonReader` (request body from `MemorySegment`) and `JsonStream` (streaming GZIP reader at build time). No external library; eliminates allocation and reflection.
 - **Response pre-building**: all 6 possible responses (`fraudCount` 0–5) are encoded to bytes at startup and written directly — zero allocation on the hot path.
 - **Module flags**: `--enable-native-access=ALL-UNNAMED --add-modules=jdk.incubator.vector`.
@@ -103,13 +106,13 @@ Implication: under load, degrade gracefully (return *something* in budget) rathe
 ├── lb/
 │   ├── Dockerfile              # alpine build → scratch runtime (static musl binary)
 │   ├── Makefile
-│   └── src/lb.c                # single-file epoll LB: TCP accept, UDS frame proxy, worker FSM
+│   └── src/lb.c                # single-file epoll LB: TCP accept, SCM_RIGHTS fd handoff, ctrl reconnect FSM
 ├── api/
 │   ├── Dockerfile              # single build stage (installs indexer → builds api) → indexer stage → runtime JRE
 │   ├── pom.xml                 # test dep on br.rinha:indexer:0.1.0 (test scope only)
 │   └── src/
 │       ├── main/java/rinha/
-│       │   ├── Api.java                # FFM UDS client, length-prefix framed read/write loop
+│       │   ├── Api.java                # FFM SCM_RIGHTS receiver: bind ctrl UDS, recvmsg(tcp_fd) loop, HTTP/1.1 direct
 │       │   ├── IvfLoader.java          # background mmap loader, /ready state
 │       │   ├── FraudScoreHandler.java  # vector encoding, IVF search, response
 │       │   ├── Normalizer.java         # normalization constants & MCC risk table
@@ -137,8 +140,8 @@ Branches: `main` = source; `submission` = artifacts with `docker-compose.yml` at
 
 See `docker-compose.yml` at repo root for the authoritative version. Key points:
 
-- `lb` starts first (no `depends_on`). Builds from `./lb`. Creates `/run/sockets/api1.sock` and `api2.sock` at startup.
-- `api1`, `api2`: `depends_on: lb`. Built from `./api`. Data files bundled into the image; no runtime mount of `references.json.gz`. Shared `sockets` volume for UDS files. Env `LB_SOCK` points each worker at its socket.
+- `api1`, `api2` start first (no `depends_on`). Each binds its own `/run/sockets/apiN.ctrl` UDS listen socket at JVM startup (before IVF loads). Built from `./api`. Data files bundled into the image. Env `API_CTRL_SOCK` names the ctrl socket.
+- `lb`: `depends_on: api1/api2: service_started`. Blocks in a 50 ms retry loop until `connect()` to each ctrl socket succeeds, then opens `:9999`. Env `WORKERS` lists ctrl socket paths.
 - Resource limits: lb `0.15 CPU / 30 MB`; each api `0.425 CPU / 160 MB`. Total ≤ 1 CPU / 350 MB.
 - No `security_opt` anywhere — default Docker seccomp profile is sufficient (epoll + standard UDS, no io_uring).
 
@@ -155,7 +158,7 @@ Run end-to-end: `./tests/run.sh`
 ## Constraints to keep in front of mind
 
 - Test machine: **Mac Mini Late 2014, 2.6 GHz, 8 GB, Ubuntu 24.04**. Don't assume modern AVX-512; Haswell-era AVX2 is the ceiling.
-- No kernel version constraint from the LB (epoll is universal). Ubuntu 24.04 is fine.
+- No kernel version constraint from the LB (epoll + SCM_RIGHTS are universal). Ubuntu 24.04 is fine. SCM_RIGHTS over UDS does not require `security_opt` — default Docker seccomp allows `sendmsg`/`recvmsg`.
 - "Using test payloads as reference or for fraud lookup is not allowed." Index is from the bundled `references.json.gz` only.
 - Deadline: **2026-06-05 23:59:59 UTC-3**. Trigger official test via a GitHub issue containing `rinha/test`.
 
@@ -168,6 +171,7 @@ Run end-to-end: `./tests/run.sh`
 5. ~~Vector API SIMD on distance kernel.~~
 6. ~~Replace KD-Tree with IVF k-means (K=2048, nprobe=4); p99 ≈ 0.82 ms, 148/148 correctness.~~
 7. ~~Replace SoNoForevis with custom C epoll LB (byte-proxy, no SCM_RIGHTS, no security_opt).~~
+8. ~~Revert LB transport to SCM_RIGHTS fd-passing; APIs bind ctrl UDS, LB connects. Eliminates startup race — LB blocks until workers connected before opening :9999.~~
 
 ## Remaining optimization levers
 
@@ -176,7 +180,7 @@ Run end-to-end: `./tests/run.sh`
 - Heap sizing: explicit `-Xmx` to avoid JVM over-reserving in 160 MB container.
 - IVF tuning: increase `nprobe` for better recall at cost of latency; increase K for smaller clusters (faster scan); OPQ/PQ residual compression if memory becomes tight.
 - Centroid scan (K=2048 × 16 shorts) is a flat SIMD sweep — already cache-friendly. Cluster scan (nprobe × avg_cluster_size ≈ 4 × 1500 points) is the hot inner loop; pre-sorting clusters by access frequency could improve cache warmth.
-- LB backpressure tuning: current queue cap is 64 pending clients; raise or lower based on load test results.
+- LB backpressure: `sendmsg` EAGAIN (ctrl socket buffer full) responds 503. Raise `SO_SNDBUF` on the ctrl socket if this triggers under sustained load before adding queueing complexity.
 
 ## Useful upstream pointers
 
