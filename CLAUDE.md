@@ -1,31 +1,43 @@
-# Rinha de Backend 2026 — Java + SoNoForevis
+# Rinha de Backend 2026 — Java + custom C load balancer
 
 Solution for [zanfranceschi/rinha-de-backend-2026](https://github.com/zanfranceschi/rinha-de-backend-2026).
-API in Java, fronted by [jairoblatt/SoNoForevis](https://github.com/jairoblatt/SoNoForevis) as load balancer.
+API in Java, fronted by a custom C load balancer (`lb/`) built with epoll.
 
 ## Architecture
 
 ```
-client → :9999 → SoNoForevis (TCP accept)
-                   └─ SCM_RIGHTS over /run/api{1,2}.ctrl ──▶ api1 (JVM)
-                                                          └▶ api2 (JVM)
+client → :9999 → lb (C, epoll, single-thread)
+                   ├─ /run/sockets/api1.sock ──▶ api1 (JVM, persistent UDS conn)
+                   └─ /run/sockets/api2.sock ──▶ api2 (JVM, persistent UDS conn)
 ```
 
-SoNoForevis does **not** proxy bytes. It `accept()`s the TCP connection and passes the raw FD to one of the API workers via `sendmsg()` ancillary data over a Unix Domain Socket. Each API worker must `recvmsg()` on its `.ctrl` socket, recover the FD, and serve HTTP directly on it. This eliminates the load-balancer→upstream copy entirely.
+The LB owns both UDS files (`bind`/`listen`). Each API worker connects into the LB at startup and maintains **one persistent UDS connection**. The LB byte-proxies TCP traffic to workers via a length-prefixed frame protocol — no FD passing, no `security_opt`.
+
+### Wire protocol (LB ↔ API, little-endian)
+
+```
+[u32 LE length][payload bytes]
+```
+
+- **Request**: LB reads the full HTTP request from TCP (parsing `Content-Length` to find the boundary), sends it to the worker as one frame.
+- **Response**: Java writes a framed HTTP response; LB reads it, strips the frame header, writes the raw HTTP bytes to the TCP client.
+
+### LB worker FSM
+
+Each worker slot is `WAIT → IDLE → BUSY`. Only one request is in-flight per worker at a time — the next frame the LB reads from a worker's UDS is unambiguously the response for that worker's current TCP client. No request IDs needed; mixing is structurally impossible.
 
 ### Components
 
-- **lb (SoNoForevis)**: pre-built image or build from source with `RUSTFLAGS="-C target-cpu=haswell"`. Listens on `:9999`. Env: `PORT=9999`, `UPSTREAMS=/run/api1.ctrl,/run/api2.ctrl`, `WORKERS=1`.
-- **api1, api2**: identical Java services. Each listens on its own `.ctrl` Unix socket, receives FDs, parses HTTP/1.1, runs fraud scoring, writes response, closes.
+- **lb**: built from `./lb` (Alpine + musl static build → `scratch` image). Single-thread epoll loop. Env: `PORT=9999`, `UPSTREAMS=/run/sockets/api1.sock,/run/sockets/api2.sock`. No `security_opt` required (uses epoll, not io_uring).
+- **api1, api2**: identical Java services. Each connects to its UDS at startup and runs a `readFrame → handle → writeFrame` loop. Env: `LB_SOCK=/run/sockets/api{1,2}.sock`.
 
 ### Resource budget (hard cap, sum of all containers ≤ 1 CPU / 350 MB)
 
-Starting point — tune after profiling:
 - lb: `0.15` CPU, `30 MB`
 - api1: `0.425` CPU, `160 MB`
 - api2: `0.425` CPU, `160 MB`
 
-Shared volume between containers for the `.ctrl` sockets (e.g. tmpfs mounted at `/run`).
+Shared named Docker volume `sockets` mounted at `/run/sockets` in all containers.
 
 ## API contract
 
@@ -55,22 +67,12 @@ Payload fields and the 14-dim vector are defined in the challenge's `DETECTION_R
 
 Constants come from `normalization.json` and `mcc_risk.json`. Reference data is `references.json.gz` (≈3M labeled vectors). All three are fixed across test runs — load once at boot.
 
-## The SCM_RIGHTS problem (critical)
-
-JDK's `java.net` UDS support does **not** expose `recvmsg()` ancillary data. We pull a raw TCP FD out of a `cmsg` using **Foreign Function & Memory API** (final since JDK 22, mature in 25):
-
-- `recvmsg(2)` via `Linker` downcall, parse `cmsghdr` at offset +16 to extract int FD.
-- Reads/writes served via FFM `read`/`write` downcalls directly on the raw FD — no `SocketChannel` wrapping, no reflection into `sun.nio.ch`.
-- Pre-allocated message structs (`iov` 16 B, `cmsg` 24 B, `msg` 56 B) reused across requests.
-- 5-cycle FFM warm-up loop at startup to JIT-compile downcalls before real requests arrive.
-
-JVM flags required: `--enable-native-access=ALL-UNNAMED`. No `--add-opens` needed (we don't wrap as `SocketChannel`).
-
 ## Java service design
 
 - **JDK**: **Eclipse Temurin JDK 25 HotSpot** (runtime image `eclipse-temurin:25-jre`). GraalVM native-image was benchmarked and lost to JIT on the fraud-score hot path — HotSpot is the current choice. AppCDS and GC tuning are levers still available if needed: `-XX:+UseCompactObjectHeaders` (JEP 519, final in JDK 25) saves 8 B/object; `-XX:+UseSerialGC` for cleanest pause profile; `-XX:+UseShenandoahGC -XX:ShenandoahGCMode=generational` (JEP 521) if allocation spikes from JSON parsing hurt p99.
 - **No framework**. Hand-rolled HTTP/1.1 parser and response writer; only two routes. Spring/Quarkus/Micronaut blow the memory budget.
-- **Event loop**: single thread per API container (`accept()` → serve → `close()`). CPU budget is ~0.4 vCPU — one thread is right. Virtual threads are *not* the right tool here.
+- **Event loop**: single thread per API container (connect → framed read/write loop). CPU budget is ~0.4 vCPU — one thread is right. Virtual threads are *not* the right tool here.
+- **FFM I/O**: `Api.java` uses JDK 25 Foreign Function & Memory API (`Linker` downcalls) for `socket`/`connect`/`read`/`write`/`close` — same approach as before, just no `recvmsg`/`bind`/`listen`/`accept`. 5-cycle warm-up loop at startup JIT-compiles the stubs.
 - **JSON**: hand-written parsers — `JsonReader` (request body from `MemorySegment`) and `JsonStream` (streaming GZIP reader at build time). No external library; eliminates allocation and reflection.
 - **Response pre-building**: all 6 possible responses (`fraudCount` 0–5) are encoded to bytes at startup and written directly — zero allocation on the hot path.
 - **Module flags**: `--enable-native-access=ALL-UNNAMED --add-modules=jdk.incubator.vector`.
@@ -98,12 +100,16 @@ Implication: under load, degrade gracefully (return *something* in budget) rathe
 ```
 .
 ├── docker-compose.yml
+├── lb/
+│   ├── Dockerfile              # alpine build → scratch runtime (static musl binary)
+│   ├── Makefile
+│   └── src/lb.c                # single-file epoll LB: TCP accept, UDS frame proxy, worker FSM
 ├── api/
 │   ├── Dockerfile              # single build stage (installs indexer → builds api) → indexer stage → runtime JRE
 │   ├── pom.xml                 # test dep on br.rinha:indexer:0.1.0 (test scope only)
 │   └── src/
 │       ├── main/java/rinha/
-│       │   ├── Api.java                # FFM server loop, recvmsg, HTTP parse/write
+│       │   ├── Api.java                # FFM UDS client, length-prefix framed read/write loop
 │       │   ├── IvfLoader.java          # background mmap loader, /ready state
 │       │   ├── FraudScoreHandler.java  # vector encoding, IVF search, response
 │       │   ├── Normalizer.java         # normalization constants & MCC risk table
@@ -115,6 +121,12 @@ Implication: under load, degrade gracefully (return *something* in budget) rathe
 │   ├── pom.xml                 # standalone Maven module, no external deps
 │   └── src/main/java/rinha/index/
 │       └── BuildIndex.java     # offline: k-means IVF build, writes index.bin (version 3)
+├── tests/
+│   ├── run.sh                  # docker compose up → wait ready → correctness → anti_mix → perf → down
+│   ├── correctness.py          # wire-level correctness against test-data.json; writes expected.json
+│   ├── anti_mix.py             # 10 × 256 concurrent requests; detects LB response cross-wiring
+│   ├── perf.sh                 # wrk p99 thresholds (target <5 ms, hard fail >15 ms)
+│   └── post.lua                # wrk script with a real fraud-score request body
 └── participants/
     └── carlsonsantana.json     # submission metadata
 ```
@@ -125,16 +137,25 @@ Branches: `main` = source; `submission` = artifacts with `docker-compose.yml` at
 
 See `docker-compose.yml` at repo root for the authoritative version. Key points:
 
-- `api1`, `api2`: built from `./api` (Dockerfile has a single `build` Maven stage — installs `indexer` module first so `api` can resolve it as a test dependency, then builds `api`; followed by an `indexer` stage that runs `BuildIndex`; then the runtime JRE stage). Data files bundled into the image; no runtime mount of `references.json.gz`. Shared `sockets` tmpfs volume for `.ctrl` UDS files.
-- `lb`: SoNoForevis image. `UPSTREAMS=/run/api1.ctrl,/run/api2.ctrl`. Shares the same `sockets` volume.
+- `lb` starts first (no `depends_on`). Builds from `./lb`. Creates `/run/sockets/api1.sock` and `api2.sock` at startup.
+- `api1`, `api2`: `depends_on: lb`. Built from `./api`. Data files bundled into the image; no runtime mount of `references.json.gz`. Shared `sockets` volume for UDS files. Env `LB_SOCK` points each worker at its socket.
 - Resource limits: lb `0.15 CPU / 30 MB`; each api `0.425 CPU / 160 MB`. Total ≤ 1 CPU / 350 MB.
+- No `security_opt` anywhere — default Docker seccomp profile is sufficient (epoll + standard UDS, no io_uring).
 
 Network must be `bridge` (no `host`, no `privileged`). Images must be public linux/amd64.
+
+## Tests
+
+Run end-to-end: `./tests/run.sh`
+
+- **correctness.py**: sends every entry from `api/src/test/resources/test-data.json` over the wire and checks `{approved, fraud_score}`. Writes `tests/expected.json` on success.
+- **anti_mix.py**: 10 rounds × 256 concurrent `asyncio` requests; verifies each response matches the expected for the input that was sent. Detects LB response cross-wiring.
+- **perf.sh**: wrk 30 s, 64 connections — p99 target <5 ms, hard fail >15 ms.
 
 ## Constraints to keep in front of mind
 
 - Test machine: **Mac Mini Late 2014, 2.6 GHz, 8 GB, Ubuntu 24.04**. Don't assume modern AVX-512; Haswell-era AVX2 is the ceiling.
-- Linux kernel ≥ 5.1 required by SoNoForevis (`io_uring`). Ubuntu 24.04 is fine.
+- No kernel version constraint from the LB (epoll is universal). Ubuntu 24.04 is fine.
 - "Using test payloads as reference or for fraud lookup is not allowed." Index is from the bundled `references.json.gz` only.
 - Deadline: **2026-06-05 23:59:59 UTC-3**. Trigger official test via a GitHub issue containing `rinha/test`.
 
@@ -146,6 +167,7 @@ Network must be `bridge` (no `host`, no `privileged`). Images must be public lin
 4. ~~Wire SoNoForevis, two replicas, docker-compose end-to-end.~~
 5. ~~Vector API SIMD on distance kernel.~~
 6. ~~Replace KD-Tree with IVF k-means (K=2048, nprobe=4); p99 ≈ 0.82 ms, 148/148 correctness.~~
+7. ~~Replace SoNoForevis with custom C epoll LB (byte-proxy, no SCM_RIGHTS, no security_opt).~~
 
 ## Remaining optimization levers
 
@@ -154,8 +176,8 @@ Network must be `bridge` (no `host`, no `privileged`). Images must be public lin
 - Heap sizing: explicit `-Xmx` to avoid JVM over-reserving in 160 MB container.
 - IVF tuning: increase `nprobe` for better recall at cost of latency; increase K for smaller clusters (faster scan); OPQ/PQ residual compression if memory becomes tight.
 - Centroid scan (K=2048 × 16 shorts) is a flat SIMD sweep — already cache-friendly. Cluster scan (nprobe × avg_cluster_size ≈ 4 × 1500 points) is the hot inner loop; pre-sorting clusters by access frequency could improve cache warmth.
+- LB backpressure tuning: current queue cap is 64 pending clients; raise or lower based on load test results.
 
 ## Useful upstream pointers
 
 - Challenge spec (EN): `docs/en/README.md` and `docs/en/DETECTION_RULES.md` in the rinha repo.
-- SoNoForevis FD-passing reference: `src/fd.rs` in that repo; Kerrisk *The Linux Programming Interface* §61.13.3 (`scm_rights_recv.c`).
